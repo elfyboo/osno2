@@ -1,0 +1,31 @@
+[package]
+name = "osno2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 1. Interface & Rendering Engine
+ratatui = { version = "0.30.1", features = ["crossterm", "macros", "all-widgets"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+# 2. Async Infrastructure & Multithreading Communication
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
+crossbeam-channel = "0.5"
+
+# 3. Native Audio Core & Frequency Decoding
+cpal = "0.15"
+symphonia = { version = "0.5", features = ["all"] }
+rustfft = "6.2"
+
+# 4. Command Pipeline & Structured Data Formats
+clap = { version = "4.5", features = ["derive", "string"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+directories = "5.0"
+
+# Optimize performance targets across the layout matrix
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

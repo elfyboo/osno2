@@ -1,0 +1,16 @@
+[engine]
+sample_rate = 44100
+buffer_size = 512
+default_volume = 70
+crossfade_seconds = 3
+
+[theme]
+primary_accent = "cyan"
+prompt_border = "magenta"
+matrix_visualizer = "green"
+
+[paths]
+# Production targets can map to standard home folders
+music_directories = [
+    "~/Music"
+]
