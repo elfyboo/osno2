@@ -10,11 +10,8 @@ use crate::ui::app::App;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = setup_terminal()?;
-
     let result = event_loop(&mut terminal);
-
     teardown_terminal(&mut terminal)?;
-
     result
 }
 
@@ -40,7 +37,6 @@ fn event_loop(
 
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-
         if crossterm::event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 if should_quit(key) {
@@ -55,9 +51,11 @@ fn event_loop(
 }
 
 fn should_quit(key: KeyEvent) -> bool {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
     match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+        KeyCode::Char('c') | KeyCode::Char('C') => true,
         _ => false,
     }
 }
