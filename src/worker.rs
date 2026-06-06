@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -10,8 +10,11 @@ use crate::ui::app::App;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = setup_terminal()?;
+
     let result = event_loop(&mut terminal);
+
     teardown_terminal(&mut terminal)?;
+
     result
 }
 
@@ -37,17 +40,24 @@ fn event_loop(
 
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        if crossterm::event::poll(std::time::Duration::from_millis(16))? {
+
+        // Drain all pending events before the next frame to avoid input lag
+        // accumulating across slow renders. Filter to Press only -- crossterm
+        // emits Repeat and Release on some terminals, causing doubled input.
+        while crossterm::event::poll(std::time::Duration::from_millis(0))? {
             if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
                 if should_quit(key) {
-                    break;
+                    return Ok(());
                 }
                 app.handle_key(key);
             }
         }
-    }
 
-    Ok(())
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
 }
 
 fn should_quit(key: KeyEvent) -> bool {
