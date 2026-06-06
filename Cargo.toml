@@ -4,26 +4,28 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# 1. Interface & Rendering Engine
+# Interface & Rendering
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 ratatui = { version = "0.30.1", features = ["crossterm", "macros", "all-widgets"] }
-crossterm = { version = "0.29", features = ["event-stream"] }
 
-# 2. Async Infrastructure & Multithreading Communication
-tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
-crossbeam-channel = "0.5"
+# Async Infrastructure & Channel Communication
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
+crossbeam-channel = "0.5.15"
 
-# 3. Native Audio Core & Frequency Decoding
-cpal = "0.15"
-symphonia = { version = "0.5", features = ["all"] }
-rustfft = "6.2"
+# Audio Core & Decoding
+cpal = "0.17.3"
+rustfft = "6.4.1"
+symphonia = { version = "0.6.0", features = ["all"] }
 
-# 4. Command Pipeline & Structured Data Formats
-clap = { version = "4.5", features = ["derive", "string"] }
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
-directories = "5.0"
+# Command Pipeline & Structured Data
+clap = { version = "4.6.1", features = ["derive", "string"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
+directories = "6.0.0"
 
-# Optimize performance targets across the layout matrix
+# WezTerm process spawning & PATH resolution
+which = "8.0.2"
+
 [profile.release]
 opt-level = 3
 lto = true

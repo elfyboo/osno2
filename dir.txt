@@ -1,11 +1,38 @@
-.
-├── Cargo.lock
-├── Cargo.toml
-├── LICENSE
-├── design.md
-├── dir.txt
-└── src
-    ├── main.rs
-    └── prompt.rs
-
-2 directories, 7 files
+src/
+├── main.rs                 # Entry point, launcher/worker flag dispatch
+├── launcher.rs             # wezterm PATH resolution, process spawn, fallback logic
+├── worker.rs               # Raw mode init, alternate screen, Drop teardown, top-level loop
+│
+├── audio/
+│   ├── mod.rs
+│   ├── engine.rs           # CPAL thread, ring buffer, real-time loop
+│   ├── decoder.rs          # Symphonia format/track decoding pipeline
+│   ├── dsp.rs              # Volume mixing, FFT extraction, window functions
+│   └── queue.rs            # Playback queue state, track advancement
+│
+├── ui/
+│   ├── mod.rs
+│   ├── app.rs              # Top-level App state struct, event dispatch
+│   ├── layout.rs           # Ratatui constraint definitions, panel geometry
+│   ├── widgets/
+│   │   ├── mod.rs
+│   │   ├── player.rs       # Now-playing bar, progress, metadata display
+│   │   ├── library.rs      # Track list, fuzzy search results
+│   │   ├── visualizer.rs   # FFT spectrum renderer
+│   │   └── command.rs      # REPL input bar, clap parse integration
+│   └── theme.rs            # Color palette, style constants
+│
+├── library/
+│   ├── mod.rs
+│   ├── scanner.rs          # Async directory walk, format detection
+│   ├── index.rs            # SQLite read/write, track catalog ops
+│   └── metadata.rs         # Tag extraction via Symphonia probe
+│
+├── config/
+│   ├── mod.rs
+│   ├── paths.rs            # AppPaths
+│   └── settings.rs         # config.toml deserialization, defaults
+│
+└── ipc/
+    ├── mod.rs
+    └── channels.rs         # Channel type definitions, message enums between threads
