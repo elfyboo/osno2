@@ -2,18 +2,17 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
 };
 
 use cpal::{
+    Device, SampleFormat, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    BufferSize, Device, SampleFormat, Stream, StreamConfig,
 };
-use crossbeam_channel::{bounded, Receiver, Sender};
-use rustfft::{num_complex::Complex, FftPlanner};
+use crossbeam_channel::{Receiver, Sender, bounded};
+use rustfft::{FftPlanner, num_complex::Complex};
 use symphonia::core::{
     audio::{AudioBufferRef, Signal},
-    codecs::{DecoderOptions, CODEC_TYPE_NULL},
+    codecs::DecoderOptions,
     errors::Error,
     formats::FormatOptions,
     io::MediaSourceStream,
@@ -26,17 +25,48 @@ use symphonia::default::get_probe;
 #[derive(Debug, Clone)]
 pub enum AudioCommand {
     Play(PathBuf),
-    Stop,
-    Pause,
-    Resume,
-    SetVolume(u8),       // 0 to 100
-    SetCrossfade(u32),    // Seconds
+    _Stop,
+    _Pause,
+    _Resume,
+    SetVolume(u8),      // 0 to 100
+    _SetCrossfade(u32), // Seconds
+}
+
+pub struct AudioContext {
+    _host: cpal::platform::Host,
+    device: cpal::platform::Device,
+    config: cpal::SupportedStreamConfig,
 }
 
 pub struct AudioEngine {
+    _context: AudioContext,
     command_tx: Sender<AudioCommand>,
     fft_rx: Receiver<Vec<f32>>,
     _stream: Stream,
+}
+
+impl AudioContext {
+    /// Creates a new AudioContext with default CPAL configuration
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Initialize CPAL with proper error handling
+        let host = cpal::default_host();
+
+        // Get the default output device
+        let device = host
+            .default_output_device()
+            .ok_or("No default output device available")?;
+
+        // Get the default output configuration
+        let config = device
+            .default_output_config()
+            .map_err(|e| format!("Failed to get default output config: {:?}", e))?;
+
+        Ok(Self {
+            config,
+            _host: host,
+            device: device,
+        })
+    }
 }
 
 impl AudioEngine {
@@ -47,22 +77,28 @@ impl AudioEngine {
         let (command_tx, command_rx) = bounded(10);
         let (fft_tx, fft_rx) = bounded(1);
 
-        // Initialize CPAL
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or("No default output device available")?;
-        let config = device.default_output_config()?;
+        // initialize CPAL context
+        let context = AudioContext::new()?;
+        let config = context.config.clone().into();
 
         // Create the audio stream
-        let stream = match config.sample_format() {
-            SampleFormat::F32 => Self::build_stream::<f32>(&device, &config.into(), command_rx, fft_tx)?,
-            SampleFormat::I16 => Self::build_stream::<i16>(&device, &config.into(), command_rx, fft_tx)?,
-            SampleFormat::U16 => Self::build_stream::<u16>(&device, &config.into(), command_rx, fft_tx)?,
-            sample_format => return Err(format!("Unsupported sample format: '{sample_format}'").into()),
+        let stream = match context.config.sample_format() {
+            SampleFormat::F32 => {
+                Self::build_stream::<f32>(&context.device, &config, command_rx, fft_tx)?
+            }
+            SampleFormat::I16 => {
+                Self::build_stream::<i16>(&context.device, &config, command_rx, fft_tx)?
+            }
+            SampleFormat::U16 => {
+                Self::build_stream::<u16>(&context.device, &config, command_rx, fft_tx)?
+            }
+            sample_format => {
+                return Err(format!("Unsupported sample format: '{sample_format}'").into());
+            }
         };
 
         Ok(Self {
+            _context: context,
             command_tx,
             fft_rx,
             _stream: stream,
@@ -86,7 +122,7 @@ impl AudioEngine {
         fft_tx: Sender<Vec<f32>>,
     ) -> Result<Stream, Box<dyn std::error::Error>>
     where
-        T: cpal::Sample + rustfft::num_traits::Zero,
+        T: cpal::Sample + cpal::SizedSample + rustfft::num_traits::Zero + cpal::FromSample<f32>,
     {
         // Create shared state
         let shared_state = Arc::new(Mutex::new(SharedState::new()));
@@ -112,29 +148,25 @@ impl AudioEngine {
     }
 
     fn decoder_thread(command_rx: Receiver<AudioCommand>, shared_state: Arc<Mutex<SharedState>>) {
-        let mut current_path = None;
         let mut volume = 1.0; // Default volume (100%)
 
         while let Ok(cmd) = command_rx.recv() {
             match cmd {
                 AudioCommand::Play(path) => {
-                    current_path = Some(path);
-                    if let Some(path) = &current_path {
-                        if let Err(e) = Self::decode_and_queue(path, &shared_state, volume) {
-                            eprintln!("Error decoding audio: {}", e);
-                        }
+                    if let Err(e) = Self::decode_and_queue(&path, &shared_state, volume) {
+                        eprintln!("Error decoding audio: {:?}", e);
                     }
                 }
-                AudioCommand::Stop => {
+                AudioCommand::_Stop => {
                     let mut state = shared_state.lock().unwrap();
                     state.playback_buffer.clear();
                     state.is_playing = false;
                 }
-                AudioCommand::Pause => {
+                AudioCommand::_Pause => {
                     let mut state = shared_state.lock().unwrap();
                     state.is_playing = false;
                 }
-                AudioCommand::Resume => {
+                AudioCommand::_Resume => {
                     let mut state = shared_state.lock().unwrap();
                     state.is_playing = true;
                 }
@@ -143,7 +175,7 @@ impl AudioEngine {
                     let mut state = shared_state.lock().unwrap();
                     state.volume = volume;
                 }
-                AudioCommand::SetCrossfade(_) => {
+                AudioCommand::_SetCrossfade(_) => {
                     // Crossfade implementation would go here
                 }
             }
@@ -172,13 +204,16 @@ impl AudioEngine {
         let mut format = probed.format;
 
         // Get the default track
-        let track = format.default_track().ok_or("No default track")?;
-        let dec_opts: DecoderOptions = Default::default();
+        let (track_id, codec_params) = {
+            let t = format.default_track().ok_or("No default track")?;
+            (t.id, t.codec_params.clone())
+        };
 
         // Create a decoder for the track
+        let dec_opts: DecoderOptions = Default::default();
         let mut decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &dec_opts)
-            .ok_or("Unsupported codec")?;
+            .make(&codec_params, &dec_opts)
+            .map_err(|e| format!("Failed to create decoder: {:?}", e))?;
 
         // Decode packets and queue samples
         let mut state = shared_state.lock().unwrap();
@@ -192,32 +227,31 @@ impl AudioEngine {
                     // Handle reset if needed
                     continue;
                 }
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("Error reading packet: {:?}", e);
+                    break;
+                }
             };
 
-            if packet.track_id() != track.id {
+            if packet.track_id() != track_id {
                 continue;
             }
 
             match decoder.decode(&packet) {
-                Ok(audio_buf) => {
-                    if let AudioBufferRef::F32(buf) = audio_buf {
+                Ok(audio_buf) => match audio_buf {
+                    AudioBufferRef::F32(buf) => {
                         for sample in buf.chan(0) {
                             state.playback_buffer.push(*sample * volume);
                         }
                     }
-                }
-                Err(Error::IoError(_)) => {
-                    // Handle I/O error
+                    _ => {
+                        eprintln!("Unsupported audio buffer type");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Error decoding packet: {:?}", e);
                     break;
-                }
-                Err(Error::DecodeError(_)) => {
-                    // Handle decode error
-                    continue;
-                }
-                Err(Error::ResetRequired) => {
-                    // Handle reset if needed
-                    continue;
                 }
             }
         }
@@ -230,7 +264,7 @@ impl AudioEngine {
         shared_state: &Arc<Mutex<SharedState>>,
         fft_tx: &Sender<Vec<f32>>,
     ) where
-        T: cpal::Sample + rustfft::num_traits::Zero,
+        T: cpal::Sample + cpal::SizedSample + rustfft::num_traits::Zero + cpal::FromSample<f32>,
     {
         let mut state = shared_state.lock().unwrap();
 
@@ -246,7 +280,7 @@ impl AudioEngine {
 
         while samples_written < samples_needed && !state.playback_buffer.is_empty() {
             let sample = state.playback_buffer.remove(0);
-            let converted_sample = cpal::Sample::from::<f32>(&sample);
+            let converted_sample = cpal::Sample::from_sample::<f32>(sample);
             output[samples_written] = converted_sample;
             samples_written += 1;
 
@@ -267,7 +301,8 @@ impl AudioEngine {
             let mut planner = FftPlanner::new();
             let fft = planner.plan_fft_forward(512);
 
-            let mut buffer: Vec<Complex<f32>> = state.visualizer_window
+            let mut buffer: Vec<Complex<f32>> = state
+                .visualizer_window
                 .iter()
                 .map(|&x| Complex::new(x, 0.0))
                 .collect();
@@ -288,7 +323,7 @@ impl AudioEngine {
                 .collect();
 
             // Normalize the magnitudes
-            let max_magnitude = magnitudes.iter().fold(0.0, |a, &b| a.max(b));
+            let max_magnitude = magnitudes.iter().fold(0.0f32, |a, &b| a.max(b));
             if max_magnitude > 0.0 {
                 for magnitude in magnitudes.iter_mut() {
                     *magnitude /= max_magnitude;

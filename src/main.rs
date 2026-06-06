@@ -1,3 +1,5 @@
+mod audio;
+mod config;
 mod prompt;
 
 use std::io;
@@ -20,6 +22,7 @@ use ratatui::{
 
 // Pull in the isolated prompt parsing layer
 use prompt::{Command, LoopMode, OsnoPrompt};
+use audio::{AudioCommand, AudioEngine};
 
 // =============================================================================
 // 1. Application Runtime State
@@ -32,10 +35,11 @@ struct AppState {
     volume: u8,
     loop_mode: LoopMode,
     should_quit: bool,
+    audio_engine: AudioEngine,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(audio_engine: AudioEngine) -> Self {
         Self {
             input_buffer: String::new(),
             logs: vec!["osno2 engine online. Type /play <song> to start.".to_string()],
@@ -43,6 +47,7 @@ impl AppState {
             volume: 70,
             loop_mode: LoopMode::Off,
             should_quit: false,
+            audio_engine,
         }
     }
 
@@ -52,10 +57,16 @@ impl AppState {
                 let track = query.join(" ");
                 self.current_track = Some(track.clone());
                 self.logs.push(format!("::▶ Playing: {}", track));
+
+                // Send play command to audio engine
+                let paths = config::AppPaths::resolve();
+                let track_path = paths.library_dir.join(&track);
+                self.audio_engine.send_command(AudioCommand::Play(track_path));
             }
             Command::Volume { level } => {
                 self.volume = level;
                 self.logs.push(format!("::Volume set to {}%", level));
+                self.audio_engine.send_command(AudioCommand::SetVolume(level));
             }
             Command::Loop { mode } => {
                 self.loop_mode = mode;
@@ -104,6 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // =============================================================================
 
 async fn run_worker_appliance() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize audio engine
+    let audio_engine = AudioEngine::try_init()?;
+
     // Terminal Initialization Configuration
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -111,11 +125,18 @@ async fn run_worker_appliance() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app_state = AppState::new();
+    let mut app_state = AppState::new(audio_engine);
 
     // Primary Interactive Loop Frame
     while !app_state.should_quit {
         terminal.draw(|f| ui_layout(f, &app_state))?;
+
+        // Check for FFT data
+        if let Some(fft_data) = app_state.audio_engine.try_recv_fft() {
+            // Here you would process the FFT data for visualization
+            // For now, we'll just log that we received it
+            app_state.logs.push(format!("::FFT data received: {} bins", fft_data.len()));
+        }
 
         // 50ms polling timeout keeps the app responsive for background tasks
         if event::poll(Duration::from_millis(50))? {
@@ -134,7 +155,7 @@ async fn run_worker_appliance() -> Result<(), Box<dyn std::error::Error>> {
                                     match OsnoPrompt::parse_line(&input) {
                                         Ok(prompt) => app_state.execute_command(prompt.command),
                                         Err(err) => {
-                                            app_state.logs.push(format!("❌ Error: {}", err.raw_message()));
+                                            app_state.logs.push(format!("❌ Error: {}", err.to_string()));
                                         }
                                     }
                                 }
@@ -176,7 +197,7 @@ fn ui_layout(f: &mut ratatui::Frame, state: &AppState) {
             Constraint::Min(5),    // Main Console/Visualizer Screen
             Constraint::Length(3), // Slash Command Input Bar
         ])
-        .split(f.size());
+        .split(f.area());
 
     // Header Widget
     let track_status = state.current_track.as_deref().unwrap_or("[No Track Loaded]");
