@@ -27,7 +27,7 @@ impl AppLayout {
             Constraint::Length(3), // header
             Constraint::Min(0),    // main view
             Constraint::Length(3), // progress + fft
-            Constraint::Length(7), // metadata grid
+            Constraint::Length(6), // metadata grid
             Constraint::Length(6), // shell
         ])
         .split(area);
@@ -321,8 +321,12 @@ impl AppLayout {
         let inner = block.inner(self.metadata);
         frame.render_widget(block, self.metadata);
 
-        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(inner);
+        let cols = Layout::horizontal([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(inner);
 
         let t = &app.track_meta;
         let stars = "★".repeat(t.rating) + &"☆".repeat(5_usize.saturating_sub(t.rating));
@@ -331,14 +335,20 @@ impl AppLayout {
             meta_line("Title", &t.title),
             meta_line("Artist", &t.artist),
             meta_line("Album", &t.album),
-            meta_line("Year", &t.year),
+            meta_line("Codec", &t.codec),
         ];
 
         let col2 = vec![
             meta_line("Track", &t.track_num),
             meta_line("Genre", &t.genre),
             meta_line("Time", &t.time),
+            meta_line("Bitrate", &t.bitrate),
+        ];
+
+        let col3 = vec![
+            meta_line("Year", &t.year),
             meta_line("Size", &t.size),
+            meta_line("Sample Rate", &t.sample_rate),
             meta_line("Rating", &stars),
         ];
 
@@ -349,6 +359,10 @@ impl AppLayout {
         frame.render_widget(
             Paragraph::new(col2).style(Style::default().bg(BG_BLACK)),
             cols[1],
+        );
+        frame.render_widget(
+            Paragraph::new(col3).style(Style::default().bg(BG_BLACK)),
+            cols[2],
         );
     }
 

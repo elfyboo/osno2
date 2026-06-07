@@ -31,6 +31,9 @@ pub struct TrackMeta {
     pub time: String,
     pub size: String,
     pub rating: usize,
+    pub codec: String,
+    pub bitrate: String,
+    pub sample_rate: String,
 }
 
 pub struct App {
@@ -118,6 +121,9 @@ impl App {
                 time: "02:37".into(),
                 size: "86.00 kb".into(),
                 rating: 2,
+                codec: "MOD".into(),
+                bitrate: "—".into(),
+                sample_rate: "44.1 kHz".into(),
             },
 
             working_dir,
