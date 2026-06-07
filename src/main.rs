@@ -6,7 +6,7 @@ mod worker;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "osno2", about = "Cyberpunk terminal music appliance")]
+#[command(name = "osno2", about = "freeware terminal audio player")]
 struct Cli {
     /// Internal flag: run as TUI worker inside a WezTerm window
     #[arg(long, hide = true)]
