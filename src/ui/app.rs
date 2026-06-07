@@ -167,10 +167,12 @@ impl App {
         }
 
         // Arrow key navigation -- view-specific
-        match key.code {
-            KeyCode::Up => self.handle_up(),
-            KeyCode::Down => self.handle_down(),
-            KeyCode::Enter => self.handle_enter(),
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match (key.code, shift) {
+            (KeyCode::Up, true) => self.handle_up(),
+            (KeyCode::Down, true) => self.handle_down(),
+            (KeyCode::Enter, true) => self.handle_enter(),
+            (KeyCode::Tab, _) => self.cycle_view(),
             _ => self.handle_shell_input(key),
         }
     }
@@ -201,6 +203,16 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn cycle_view(&mut self) {
+        self.active_view = match self.active_view {
+            ActiveView::Tracklist => ActiveView::Filesystem,
+            ActiveView::Filesystem => ActiveView::Visualizer,
+            ActiveView::Visualizer => ActiveView::Settings,
+            ActiveView::Settings => ActiveView::Help,
+            ActiveView::Help => ActiveView::Tracklist,
+        };
     }
 
     fn handle_enter(&mut self) {
