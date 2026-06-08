@@ -1,28 +1,28 @@
-use crate::library::fs_entry::FsEntry;
-use crate::library::library_playlist::Playlist;
-use crate::library::library_track::Track;
+use std::fmt::Pointer;
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct LibraryService {
-    // redb database handle
-    db: redb::Database,
-    // path to meta/*.toml directory
-    meta_dir: PathBuf,
-    // path to playlists/*.toml directory
-    playlists_dir: PathBuf,
-}
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use sha2::Digest;
+use symphonia::core::common::probe::Hint;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia_core::formats::probe;
+use symphonia_core::meta::StandardTag;
 
-use redb::{ReadableTable, TableDefinition};
-use serde::{Deserialize, Serialize};
-
-// Define the Tables.
-// Key: Track ID (e.g., a hash of the path or a UUID string)
-// Value: The serialized `Track` struct as a byte array
+use crate::fs::fs_entry::{FsEntry, FsEntryKind};
+use crate::library::library_meta::{CodecInformation, TrackType, get_codec_info};
+use crate::library::library_playlist::LibraryPlaylist;
+use crate::library::library_track::LibraryTrack;
 const TRACKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tracks");
 
-// Example of an index table for fast search later:
-// Key: Search term (lowercase), Value: Comma-separated Track IDs
-const SEARCH_INDEX: TableDefinition<&str, &str> = TableDefinition::new("search_index");
+pub struct LibraryService {
+    db: redb::Database,
+    meta_dir: PathBuf,
+    playlists_dir: PathBuf,
+}
 
 impl LibraryService {
     pub fn new(db: redb::Database, meta_dir: PathBuf, playlists_dir: PathBuf) -> Self {
@@ -32,100 +32,95 @@ impl LibraryService {
             playlists_dir,
         }
     }
-
-    fn extract_track_metadata(&self, path: &Path) -> Result<Track, std::io::Error> {
+    fn extract_track_metadata(&self, path: &Path) -> Result<LibraryTrack, std::io::Error> {
         let clean_path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let file = File::open(&clean_path)?;
-        let file_metadata = file.metadata()?;
+        let size_bytes = file.metadata()?.len();
 
-        // 1. Gather baseline filesystem facts
-        let size_bytes = file_metadata.len();
         let ext = clean_path
             .extension()
             .unwrap_or_default()
             .to_string_lossy()
             .to_lowercase();
+
         let name = clean_path
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
 
-        // Generate the SHA256 ID based on the canonical path string
-        let id = format!(
-            "{:x}",
-            sha2::Sha256::digest(clean_path.to_string_lossy().as_bytes())
-        );
+        // Generate SHA-256 ID out of the canonical path string
+        let id: String = "???".to_string();
 
-        // 2. Setup Symphonia Media Source Stream
+        // format!(
+        //     "{:x}",
+        //     sha2::Sha256::digest(clean_path.to_string_lossy().as_bytes())
+        // );
+
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
         hint.with_extension(&ext);
 
-        let format_opts = FormatOptions::default();
-        let metadata_opts = MetadataOptions::default();
+        // 1. Initialize demuxer. (Mandatory step to read container headers)
+        let mut probe = symphonia::core::formats::probe::Probe::default();
+        symphonia::default::register_enabled_formats(&mut probe);
 
-        // Probe the file format
-        let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &format_opts, &metadata_opts)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let mut format_reader = probe
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?; // We extract the `FormatReader` out of the ProbeResult struct here
 
-        let mut format_reader = probed.format;
+        let mut duration_secs: u64 = 0;
+        let mut sample_rate: Option<u32> = None;
+        let mut bitrate: Option<u32> = None;
+        let mut codec_info: Option<CodecInformation> = None;
+        let mut codec_name: Option<String> = None;
 
-        // 3. Extract Audio Properties (Codec, Sample Rate, Bitrate, Duration)
-        let mut duration_secs = 0;
-        let mut sample_rate = None;
-        let mut bitrate = None;
-        let mut codec = None;
-
-        // Inspect the primary audio track
-        if let Some(track) = format_reader.default_track() {
+        // 2. Fetch ONLY the primary Audio track, ignoring video/thumbnail tracks
+        if let Some(track) = format_reader.default_track(TrackType::Audio) {
             let params = &track.codec_params;
             sample_rate = params.sample_rate;
+
+            // 3. Utilize your new custom helper module to cleanly identify the codec!
+            codec_info = get_codec_info(&params.codec);
+            if let Some(info) = &codec_info {
+                codec_name = Some(info.str_codec_id.to_string());
+            }
+
+            if let (Some(n_frames), Some(tb)) = (params.n_frames, params.time_base) {
+                let time = tb.calc_time(n_frames);
+                duration_secs = time.seconds;
+            }
+
+            // Estimate streaming bitrate if symphonia doesn't explicitly expose it
             bitrate = params.bits_per_sample.or_else(|| {
                 if duration_secs > 0 {
-                    // (Bytes * 8 bits) / seconds = bits per second
                     Some(((size_bytes * 8) / duration_secs) as u32)
                 } else {
                     None
                 }
             });
-            // Map codec type to readable string
-            codec = Some(format!("{:?}", params.codec).to_lowercase());
-
-            // Calculate duration using TimeBase and number of frames
-            if let (Some(n_frames), Some(tb)) = (params.n_frames, params.time_base) {
-                let time = tb.calc_time(n_frames);
-                duration_secs = time.seconds;
-            }
         }
 
         // 4. Extract Text Tags (Artist, Album, Title, Year)
-        let mut track_name = name.clone(); // Fallback to filename if no Title tag exists
+        let mut track_name = name.clone(); // Fallback to filename
         let mut artist = "Unknown Artist".to_string();
         let mut album = "Unknown Album".to_string();
-        let mut year = None;
+        let mut year: Option<u16> = None;
 
-        // Symphonia tracks metadata in a metadata queue layer
-        if let Some(mut metadata) = format_reader.metadata().current() {
-            // Alternatively, inspect container-level metadata if present
-            if let Some(revision) = metadata.tags() {
-                for tag in revision {
-                    if let Some(standard_key) = tag.std_key {
-                        match standard_key {
-                            StandardTagKey::TrackTitle => track_name = tag.value.to_string(),
-                            StandardTagKey::Artist => artist = tag.value.to_string(),
-                            StandardTagKey::Album => album = tag.value.to_string(),
-                            StandardTagKey::Date => {
-                                // Attempt to parse out a 4-digit year from date strings
-                                if let Ok(parsed_year) =
-                                    tag.value.to_string().get(0..4).unwrap_or("").parse::<u16>()
-                                {
-                                    year = Some(parsed_year);
-                                }
-                            }
-                            _ => {}
-                        }
+        if let Some(&metadata) = format_reader.metadata().current() {
+            for tag in metadata.clone().media.tags {
+                if let Some(std_key) = tag.clone().std {
+                    match std_key {
+                        StandardTag::TrackTitle(val) => track_name = val.to_string(),
+                        StandardTag::Artist(val) => artist = val.to_string(),
+                        StandardTag::Album(val) => album = val.to_string(),
+                        StandardTag::ReleaseYear(val) => year = Some(val),
+                        _ => {}
                     }
                 }
             }
@@ -136,7 +131,7 @@ impl LibraryService {
             .unwrap_or_default()
             .as_secs();
 
-        Ok(Track {
+        Ok(LibraryTrack {
             id,
             path: clean_path,
             name: track_name,
@@ -148,37 +143,94 @@ impl LibraryService {
             ext,
             bitrate,
             sample_rate,
-            codec,
-            rating: 0, // Unrated by default
+            codec: codec_name,
+            rating: 0,
             added_at,
         })
     }
+    pub fn read_dir(&self, path: &Path) -> Result<Vec<FsEntry>, std::io::Error> {
+        let mut entries: Vec<FsEntry> = std::fs::read_dir(path)?
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                let is_dir = path.is_dir();
+                let size_bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+                let ext = path
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                let kind = if is_dir {
+                    FsEntryKind::Directory
+                } else {
+                    FsEntryKind::File
+                };
+                FsEntry {
+                    path,
+                    name,
+                    ext,
+                    size_bytes,
+                    is_dir,
+                    kind,
+                }
+            })
+            .collect();
 
-    pub fn read_dir(&self, _path: &Path) -> Result<Vec<FsEntry>, std::io::Error> {
-        todo!()
+        // Dirs first, then files, both alphabetical
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+
+        Ok(entries)
     }
 
-    pub fn all_tracks(&self) -> Result<Vec<Track>, std::io::Error> {
-        todo!()
+    pub fn all_tracks(&self) -> Result<Vec<LibraryTrack>, std::io::Error> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let table = match read_txn.open_table(TRACKS_TABLE) {
+            Ok(t) => t,
+            // Table doesn't exist yet -- library is empty
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut tracks = Vec::new();
+        for entry in table
+            .iter()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        {
+            let (_, value) =
+                entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let toml_str = std::str::from_utf8(value.value())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if let Ok(track) = toml::from_str::<LibraryTrack>(toml_str) {
+                tracks.push(track);
+            }
+        }
+
+        Ok(tracks)
     }
 
-    pub fn search(&self, query: &str) -> Result<Vec<Track>, std::io::Error> {
-        todo!()
+    pub fn search(&self, query: &str) -> Result<Vec<LibraryTrack>, std::io::Error> {
+        let q = query.to_lowercase();
+        let tracks = self.all_tracks()?;
+        Ok(tracks
+            .into_iter()
+            .filter(|t| {
+                t.name.to_lowercase().contains(&q)
+                    || t.artist.to_lowercase().contains(&q)
+                    || t.album.to_lowercase().contains(&q)
+            })
+            .collect())
     }
 
-    pub fn add_track(&self, path: &Path) -> Result<Track, std::io::Error> {
-        // 1. Process and build the Track using Symphonia parsing pipelines
+    pub fn add_track(&self, path: &Path) -> Result<LibraryTrack, std::io::Error> {
         let track = self.extract_track_metadata(path)?;
 
-        // 2. Serialize to raw TOML text representation
-        let toml_string = toml::to_string(&track).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("TOML Serialization Failure: {e}"),
-            )
-        })?;
+        let toml_string = toml::to_string(&track)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        // 3. Atomically insert right into redb tables
         let write_txn = self
             .db
             .begin_write()
@@ -187,7 +239,6 @@ impl LibraryService {
             let mut table = write_txn
                 .open_table(TRACKS_TABLE)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
             table
                 .insert(track.id.as_str(), toml_string.as_bytes())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -200,42 +251,127 @@ impl LibraryService {
     }
 
     pub fn remove_track(&self, id: &str) -> Result<(), std::io::Error> {
-        todo!()
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        {
+            let mut table = write_txn
+                .open_table(TRACKS_TABLE)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            table
+                .remove(id)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
     }
 
     pub fn update_rating(&self, id: &str, rating: u8) -> Result<(), std::io::Error> {
-        todo!()
+        let mut track = self
+            .all_tracks()?
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Track not found"))?;
+
+        track.rating = rating.min(5);
+
+        let toml_string = toml::to_string(&track)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        {
+            let mut table = write_txn
+                .open_table(TRACKS_TABLE)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            table
+                .insert(id, toml_string.as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
     }
 
     pub fn reindex(&self) -> Result<(), std::io::Error> {
-        todo!()
-    }
-
-    pub fn all_playlists(&self) -> Result<Vec<Playlist>, std::io::Error> {
-        let mut playlists = Vec::new();
-
-        if !self.playlists_dir.exists() {
-            return Ok(playlists);
+        // Walk meta_dir for any .toml track files and re-insert into redb
+        if !self.meta_dir.exists() {
+            return Ok(());
         }
 
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        {
+            let mut table = write_txn
+                .open_table(TRACKS_TABLE)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+            for entry in std::fs::read_dir(&self.meta_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().unwrap_or_default() == "toml" {
+                    if let Ok(contents) = std::fs::read_to_string(&path) {
+                        if let Ok(track) = toml::from_str::<LibraryTrack>(&contents) {
+                            let _ = table.insert(track.id.as_str(), contents.as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
+    }
+
+    pub fn all_playlists(&self) -> Result<Vec<LibraryPlaylist>, std::io::Error> {
+        if !self.playlists_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut playlists = Vec::new();
         for entry in std::fs::read_dir(&self.playlists_dir)? {
             let entry = entry?;
             let path = entry.path();
-
             if path.extension().unwrap_or_default() == "toml" {
                 if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if let Ok(playlist) = toml::from_str::<Playlist>(&contents) {
+                    if let Ok(playlist) = toml::from_str::<LibraryPlaylist>(&contents) {
                         playlists.push(playlist);
                     }
                 }
             }
         }
-
         Ok(playlists)
     }
 
-    pub fn playlist(&self, name: &str) -> Result<Option<Vec<Track>>, std::io::Error> {
-        todo!()
+    pub fn playlist(&self, name: &str) -> Result<Option<Vec<LibraryTrack>>, std::io::Error> {
+        let safe_name = name.replace(|c: char| !c.is_alphanumeric(), "_");
+        let file_path = self.playlists_dir.join(format!("{}.toml", safe_name));
+
+        if !file_path.exists() {
+            return Ok(None);
+        }
+
+        let contents = std::fs::read_to_string(&file_path)?;
+        let playlist: LibraryPlaylist = toml::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let all = self.all_tracks()?;
+        let tracks = playlist
+            .track_ids
+            .iter()
+            .filter_map(|id| all.iter().find(|t| &t.id == id).cloned())
+            .collect();
+
+        Ok(Some(tracks))
     }
 
     pub fn create_playlist(&self, name: &str) -> Result<(), std::io::Error> {
@@ -245,18 +381,20 @@ impl LibraryService {
         if file_path.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                "Playlist exists",
+                "Playlist already exists",
             ));
         }
 
-        let playlist = Playlist {
+        std::fs::create_dir_all(&self.playlists_dir)?;
+
+        let playlist = LibraryPlaylist {
             name: name.to_string(),
             track_ids: Vec::new(),
         };
 
-        let toml_str = toml::to_string(&playlist).unwrap();
+        let toml_str = toml::to_string(&playlist)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(file_path, toml_str)?;
-
         Ok(())
     }
 
@@ -268,24 +406,37 @@ impl LibraryService {
         let safe_name = playlist_name.replace(|c: char| !c.is_alphanumeric(), "_");
         let file_path = self.playlists_dir.join(format!("{}.toml", safe_name));
 
-        // 1. Read existing
         let contents = std::fs::read_to_string(&file_path)?;
-        let mut playlist: Playlist = toml::from_str(&contents)
+        let mut playlist: LibraryPlaylist = toml::from_str(&contents)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        // 2. Modify (Prevent duplicates)
         if !playlist.track_ids.contains(&track_id.to_string()) {
             playlist.track_ids.push(track_id.to_string());
         }
 
-        // 3. Write back
-        let toml_str = toml::to_string(&playlist).unwrap();
+        let toml_str = toml::to_string(&playlist)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(file_path, toml_str)?;
-
         Ok(())
     }
 
-    pub fn remove_from_playlist(&self, playlist: &str, id: &str) -> Result<(), std::io::Error> {
-        todo!()
+    pub fn remove_from_playlist(
+        &self,
+        playlist_name: &str,
+        track_id: &str,
+    ) -> Result<(), std::io::Error> {
+        let safe_name = playlist_name.replace(|c: char| !c.is_alphanumeric(), "_");
+        let file_path = self.playlists_dir.join(format!("{}.toml", safe_name));
+
+        let contents = std::fs::read_to_string(&file_path)?;
+        let mut playlist: LibraryPlaylist = toml::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        playlist.track_ids.retain(|id| id != track_id);
+
+        let toml_str = toml::to_string(&playlist)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(file_path, toml_str)?;
+        Ok(())
     }
 }

@@ -12,5 +12,5 @@ pub struct FsEntry {
 pub enum FsEntryKind {
     Directory,
     AudioFile,
-    OtherFile,
+    File,
 }

@@ -1,4 +1,20 @@
 // src/worker.rs
+use ansi_control_codes::c0::{CR, ESC, HT};
+use ansi_control_codes::control_sequences::{CNL, CPL, CUB, CUD, CUF, CUU};
+use std::sync::LazyLock;
+
+// ANSI escape sequences for terminal control characters
+static SEQ_BACKSPACE: LazyLock<Vec<u8>> = LazyLock::new(|| vec![0x7F]);
+static SEQ_ENTER: LazyLock<Vec<u8>> = LazyLock::new(|| CR.to_string().into_bytes());
+static SEQ_TAB: LazyLock<Vec<u8>> = LazyLock::new(|| HT.to_string().into_bytes());
+static SEQ_ESC: LazyLock<Vec<u8>> = LazyLock::new(|| ESC.to_string().into_bytes());
+static SEQ_UP: LazyLock<Vec<u8>> = LazyLock::new(|| CUU(1.into()).to_string().into_bytes());
+static SEQ_DOWN: LazyLock<Vec<u8>> = LazyLock::new(|| CUD(1.into()).to_string().into_bytes());
+static SEQ_RIGHT: LazyLock<Vec<u8>> = LazyLock::new(|| CUF(1.into()).to_string().into_bytes());
+static SEQ_LEFT: LazyLock<Vec<u8>> = LazyLock::new(|| CUB(1.into()).to_string().into_bytes());
+static SEQ_HOME: LazyLock<Vec<u8>> = LazyLock::new(|| CPL(1.into()).to_string().into_bytes());
+static SEQ_END: LazyLock<Vec<u8>> = LazyLock::new(|| CNL(1.into()).to_string().into_bytes());
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -12,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 // Pull the exact 0.2.0 components out of tui-term
-use tui_term::vt100::Parser;
+use vt100::Parser;
 
 use crate::library::library_service::LibraryService;
 use crate::ui::app::{ActiveView, App, AppAction};
@@ -76,7 +92,7 @@ fn event_loop(
 
     let pty_system = NativePtySystem::default();
     let size = terminal.size()?;
-    let pty_pair = pty_system.open_pty(PtySize {
+    let pty_pair = pty_system.openpty(PtySize {
         rows: size.height,
         cols: size.width,
         pixel_width: 0,
@@ -85,6 +101,7 @@ fn event_loop(
 
     #[cfg(target_os = "windows")]
     let cmd = CommandBuilder::new("powershell.exe");
+
     #[cfg(not(target_os = "windows"))]
     let cmd = CommandBuilder::with_argv(vec![
         std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string()),
@@ -95,7 +112,7 @@ fn event_loop(
     let mut pty_writer = pty_pair.master.take_writer()?;
     let pty_reader = pty_pair.master.try_clone_reader()?;
 
-    // 0.2.0 FIX: Initialize the vt100 Parser state machine.
+    // Initialize the vt100 Parser state machine.
     // Arguments: (rows, cols, scrollback_lines) -> 1000 lines of scrollback memory
     let vt_parser = Arc::new(RwLock::new(Parser::new(size.height, size.width, 1000)));
 
@@ -159,8 +176,21 @@ fn event_loop(
                     pixel_width: 0,
                     pixel_height: 0,
                 });
-                // 0.2.0 FIX: vt100::Parser uses .set_size() for re-allocations
-                vt_parser.write().set_size(rows, cols);
+                // todo, persist scrollback history on resize
+                // let scrollback: Vec<u8> = {
+                //     let guard = vt_parser.read();
+                //     let screen = guard.screen();
+                //     // Reconstruct visible content as bytes to replay into new parser
+                //     (0..screen.rows())
+                //         .flat_map(|row| {
+                //             let mut line = screen.row_contents(row);
+                //             line.push(b'\n');
+                //             line
+                //         })
+                //         .collect()
+                // };
+                let mut new_parser = Parser::new(rows, cols, 1000);
+                // new_parser.process(&scrollback);
                 terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
             }
             AppEvent::KeyEvent(key) => {
@@ -188,16 +218,15 @@ fn event_loop(
                         }
                     },
                     InputFocus::Terminal => {
+                        // Global appliance override interception inside terminal view context
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
                         {
                             current_focus = InputFocus::App;
                             terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
                         } else {
-                            if let Some(bytes) = tui_term::types::Input::from(key).to_bytes() {
-                                let _ = pty_writer.write_all(bytes);
-                                let _ = pty_writer.flush();
-                            }
+                            // UPDATE: Passes Crossterm keys cleanly into our explicit translation function
+                            handle_terminal_key(key, &mut pty_writer);
                         }
                     }
                 }
@@ -264,32 +293,42 @@ fn execute_app_command(
     }
 }
 
-// fn event_loop(
-//     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-// ) -> Result<(), Box<dyn std::error::Error>> {
-//     let mut app = App::new();
+fn handle_terminal_key(key: KeyEvent, pty_writer: &mut Box<dyn std::io::Write + Send>) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(c) = key.code {
+            let byte = c.to_ascii_uppercase() as u8 - b'A' + 1;
+            let _ = pty_writer.write_all(&[byte]);
+            let _ = pty_writer.flush();
+            return;
+        }
+    }
 
-//     loop {
-//         terminal.draw(|frame| app.draw(frame))?;
+    let seq: Option<&[u8]> = match key.code {
+        KeyCode::Char(c) => {
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            let _ = pty_writer.write_all(s.as_bytes());
+            let _ = pty_writer.flush();
+            return;
+        }
+        KeyCode::Enter => Some(&SEQ_ENTER),
+        KeyCode::Tab => Some(&SEQ_TAB),
+        KeyCode::Backspace => Some(&SEQ_BACKSPACE),
+        KeyCode::Esc => Some(&SEQ_ESC),
+        KeyCode::Up => Some(&SEQ_UP),
+        KeyCode::Down => Some(&SEQ_DOWN),
+        KeyCode::Right => Some(&SEQ_RIGHT),
+        KeyCode::Left => Some(&SEQ_LEFT),
+        KeyCode::Home => Some(&SEQ_HOME),
+        KeyCode::End => Some(&SEQ_END),
+        _ => None,
+    };
 
-//         // Drain all pending events before the next frame to avoid input lag
-//         // accumulating across slow renders. Filter to Press only -- crossterm
-//         // emits Repeat and Release on some terminals, causing doubled input.
-//         while crossterm::event::poll(std::time::Duration::from_millis(0))? {
-//             if let Event::Key(key) = event::read()? {
-//                 if key.kind != KeyEventKind::Press {
-//                     continue;
-//                 }
-//                 if should_quit(key) {
-//                     return Ok(());
-//                 }
-//                 app.handle_key(key);
-//             }
-//         }
-
-//         std::thread::sleep(std::time::Duration::from_millis(16));
-//     }
-// }
+    if let Some(bytes) = seq {
+        let _ = pty_writer.write_all(bytes);
+        let _ = pty_writer.flush();
+    }
+}
 
 fn should_quit(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
