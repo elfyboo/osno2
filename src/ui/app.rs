@@ -1,9 +1,12 @@
+// src/ui/app.rs
+use crate::fs::fs_entry::FsEntry;
+use crate::library::library_track::LibraryTrack;
+use crate::spoofed::spoof_track_meta::TrackMeta;
+use crate::ui::layout::AppLayout;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
-use crate::ui::layout::AppLayout;
-
-#[derive(Default, PartialEq)]
+#[derive(Default, PartialEq, Debug, Clone, Copy)]
 pub enum ActiveView {
     #[default]
     Tracklist,
@@ -13,27 +16,12 @@ pub enum ActiveView {
     Help,
 }
 
-pub struct Track {
-    pub length: String,
-    pub name: String,
-    pub year: String,
-    pub artist: String,
-    pub ext: String,
-}
-
-pub struct TrackMeta {
-    pub title: String,
-    pub artist: String,
-    pub album: String,
-    pub year: String,
-    pub track_num: String,
-    pub genre: String,
-    pub time: String,
-    pub size: String,
-    pub rating: usize,
-    pub codec: String,
-    pub bitrate: String,
-    pub sample_rate: String,
+/// Actions that the UI loop delegates up to the orchestration worker
+#[derive(Debug, Clone)]
+pub enum AppAction {
+    ExecuteCommand(String),
+    ToggleTerminalFocus,
+    None,
 }
 
 pub struct App {
@@ -48,149 +36,97 @@ pub struct App {
     pub selected_track: usize,
 
     // Track list
-    pub tracks: Vec<Track>,
+    pub tracks: Vec<LibraryTrack>,
 
     // Metadata panel
     pub track_meta: TrackMeta,
 
-    // Filesystem view
+    // Filesystem view (State only!)
     pub working_dir: PathBuf,
-    pub fs_entries: Vec<String>,
+    pub fs_entries: Vec<FsEntry>, // Uses our clean model, not raw strings
     pub fs_selected: usize,
 
-    // Shell
+    // Sandboxed Application REPL History
     pub shell_history: Vec<String>,
     pub shell_input: String,
 }
 
 impl App {
     pub fn new() -> Self {
-        let tracks = vec![
-            Track {
-                length: "02:20".into(),
-                name: "Maintune.Mod".into(),
-                year: "1998".into(),
-                artist: "s0ren gessele".into(),
-                ext: "mod".into(),
-            },
-            Track {
-                length: "02:37".into(),
-                name: "Demoseq7".into(),
-                year: "1998".into(),
-                artist: "s0ren gessele".into(),
-                ext: "mod".into(),
-            },
-            Track {
-                length: "03:14".into(),
-                name: "Frontline".into(),
-                year: "1999".into(),
-                artist: "s0ren gessele".into(),
-                ext: "mod".into(),
-            },
-        ];
-
-        let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-
-        let fs_entries = vec![
-            "../".into(),
-            "front6/".into(),
-            "demos/".into(),
-            "Maintune.mod".into(),
-            "Demoseq7.mod".into(),
-        ];
-
+        // Initialize with default state or empty vectors.
+        // Your background engine will populate these asynchronously via workers later.
         Self {
             active_view: ActiveView::default(),
-
-            now_playing: "Demoseq7 (1998)".into(),
-            volume: 95,
-            position_secs: 83,  // 01:23
-            duration_secs: 157, // 02:37
-            playing_track: 1,
-            selected_track: 1,
-
-            tracks,
-
-            track_meta: TrackMeta {
-                title: "Demoseq7".into(),
-                artist: "s0ren gessele".into(),
-                album: "front6".into(),
-                year: "1998".into(),
-                track_num: "1".into(),
-                genre: "Mod/Tracker".into(),
-                time: "02:37".into(),
-                size: "86.00 kb".into(),
-                rating: 2,
-                codec: "MOD".into(),
-                bitrate: "—".into(),
-                sample_rate: "44.1 kHz".into(),
-            },
-
-            working_dir,
-            fs_entries,
+            now_playing: "No Track Playing".into(),
+            volume: 100,
+            position_secs: 0,
+            duration_secs: 0,
+            playing_track: 0,
+            selected_track: 0,
+            tracks: Vec::new(),
+            track_meta: TrackMeta::default(),
+            working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            fs_entries: Vec::new(),
             fs_selected: 0,
-
-            shell_history: vec![
-                "~/Music/Others/ cd ./front6".into(),
-                "~/Music/Others/front6/ search \"demoseq7\"".into(),
-                "~/Music/Others/front6/ play".into(),
-            ],
+            shell_history: vec!["System operational. Type commands below.".into()],
             shell_input: String::new(),
         }
     }
 
-    pub fn draw(&mut self, frame: &mut ratatui::Frame) {
+    pub fn draw(&mut self, frame: &mut ratatui::Frame, vt_screen: &tui_term::vt100::Screen) {
         let layout = AppLayout::new(frame.area());
-        layout.render(frame, self);
+        // Pass the vt_screen straight down to your AppLayout renderer layout module
+        layout.render(frame, self, vt_screen);
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
-        // View switching: Alt+1 through Alt+5
+    /// Processes keyboard interactions and returns an optional action intent back up to the worker thread loop
+    pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
+        // Global App Interception: Alt+1 through Alt+5 changes active layout view tabs
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
-                KeyCode::Char('1') => {
-                    self.active_view = ActiveView::Tracklist;
-                    return;
-                }
-                KeyCode::Char('2') => {
-                    self.active_view = ActiveView::Filesystem;
-                    return;
-                }
-                KeyCode::Char('3') => {
-                    self.active_view = ActiveView::Visualizer;
-                    return;
-                }
-                KeyCode::Char('4') => {
-                    self.active_view = ActiveView::Settings;
-                    return;
-                }
-                KeyCode::Char('5') => {
-                    self.active_view = ActiveView::Help;
-                    return;
-                }
+                KeyCode::Char('1') => self.active_view = ActiveView::Tracklist,
+                KeyCode::Char('2') => self.active_view = ActiveView::Filesystem,
+                KeyCode::Char('3') => self.active_view = ActiveView::Visualizer,
+                KeyCode::Char('4') => self.active_view = ActiveView::Settings,
+                KeyCode::Char('5') => self.active_view = ActiveView::Help,
                 _ => {}
             }
+            return AppAction::None;
         }
 
-        // Arrow key navigation -- view-specific
+        // Global Appliance Interception: Ctrl+T signals to flip hardware focus boundaries
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+        {
+            return AppAction::ToggleTerminalFocus;
+        }
+
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match (key.code, shift) {
-            (KeyCode::Up, true) => self.handle_up(),
-            (KeyCode::Down, true) => self.handle_down(),
-            (KeyCode::Enter, true) => self.handle_enter(),
-            (KeyCode::Tab, _) => self.cycle_view(),
-            _ => self.handle_shell_input(key),
+            (KeyCode::Up, _) => {
+                self.handle_up();
+                AppAction::None
+            }
+            (KeyCode::Down, _) => {
+                self.handle_down();
+                AppAction::None
+            }
+            (KeyCode::Tab, _) => {
+                self.cycle_view();
+                AppAction::None
+            }
+            (KeyCode::Enter, _) => self.handle_enter(),
+            _ => {
+                self.handle_shell_input(key);
+                AppAction::None
+            }
         }
     }
 
     fn handle_up(&mut self) {
         match self.active_view {
-            ActiveView::Tracklist => {
-                self.selected_track = self.selected_track.saturating_sub(1);
-            }
-            ActiveView::Filesystem => {
-                self.fs_selected = self.fs_selected.saturating_sub(1);
-            }
+            ActiveView::Tracklist => self.selected_track = self.selected_track.saturating_sub(1),
+            ActiveView::Filesystem => self.fs_selected = self.fs_selected.saturating_sub(1),
             _ => {}
         }
     }
@@ -221,30 +157,39 @@ impl App {
         };
     }
 
-    fn handle_enter(&mut self) {
+    fn handle_enter(&mut self) -> AppAction {
         match self.active_view {
             ActiveView::Tracklist => {
-                // Emit play command through the command processor
-                let name = self.tracks[self.selected_track].name.clone();
-                self.execute_command(&format!("play {name}"));
+                if !self.tracks.is_empty() {
+                    let track = &self.tracks[self.selected_track];
+                    AppAction::ExecuteCommand(format!("play {}", track.id))
+                } else {
+                    AppAction::None
+                }
             }
             ActiveView::Filesystem => {
-                // Emit cd command -- fs view drives via command processor only
-                let entry = self.fs_entries[self.fs_selected].clone();
-                self.execute_command(&format!("cd {entry}"));
+                if !self.fs_entries.is_empty() {
+                    let entry = &self.fs_entries[self.fs_selected];
+                    AppAction::ExecuteCommand(format!("cd {}", entry.path.display()))
+                } else {
+                    AppAction::None
+                }
             }
-            _ => {}
+            _ => {
+                // If pressing enter on the sandboxed app REPL command bar
+                let input = self.shell_input.trim().to_string();
+                if !input.is_empty() {
+                    self.shell_input.clear();
+                    AppAction::ExecuteCommand(input)
+                } else {
+                    AppAction::None
+                }
+            }
         }
     }
 
     fn handle_shell_input(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => {
-                let input = self.shell_input.trim().to_string();
-                if !input.is_empty() {
-                    self.execute_command(&input);
-                }
-            }
             KeyCode::Backspace => {
                 self.shell_input.pop();
             }
@@ -255,114 +200,10 @@ impl App {
         }
     }
 
-    // Single command throughput. All UI actions and shell input route here.
-    pub fn execute_command(&mut self, cmd: &str) {
-        let entry = format!("{}/ {}", self.working_dir.display(), cmd);
-        self.shell_history.push(entry);
-        self.shell_input.clear();
-
-        let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
-        match parts.as_slice() {
-            ["cd", path] => self.cmd_cd(path),
-            ["ls"] => self.cmd_ls(),
-            ["play", query] => self.cmd_play(query),
-            ["volume", level] => self.cmd_volume(level),
-            ["view", target] => self.cmd_view(target),
-            _ => {
-                self.shell_history.push(format!("  unknown command: {cmd}"));
-            }
-        }
-    }
-
-    fn cmd_cd(&mut self, path: &str) {
-        let target = if path.starts_with('/') {
-            PathBuf::from(path)
-        } else {
-            self.working_dir.join(path)
-        };
-
-        match std::fs::canonicalize(&target) {
-            Ok(resolved) => {
-                self.working_dir = resolved;
-                self.cmd_ls();
-                if self.active_view == ActiveView::Filesystem {
-                    self.fs_selected = 0;
-                }
-            }
-            Err(_) => {
-                self.shell_history
-                    .push(format!("  cd: no such directory: {path}"));
-            }
-        }
-    }
-
-    fn cmd_ls(&mut self) {
-        match std::fs::read_dir(&self.working_dir) {
-            Ok(entries) => {
-                let mut listing: Vec<String> = entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        if e.path().is_dir() {
-                            format!("{name}/")
-                        } else {
-                            name
-                        }
-                    })
-                    .collect();
-
-                listing.sort();
-
-                // Prepend parent dir entry
-                listing.insert(0, "../".into());
-
-                self.fs_entries = listing.clone();
-                for entry in &listing {
-                    self.shell_history.push(format!("  {entry}"));
-                }
-            }
-            Err(e) => {
-                self.shell_history.push(format!("  ls: {e}"));
-            }
-        }
-    }
-
-    fn cmd_play(&mut self, query: &str) {
-        // TODO: resolve against track index and hand off to audio engine
-        self.now_playing = query.to_string();
-        self.shell_history.push(format!("  playing: {query}"));
-    }
-
-    fn cmd_volume(&mut self, level: &str) {
-        match level.parse::<u8>() {
-            Ok(v) if v <= 100 => {
-                self.volume = v;
-                self.shell_history.push(format!("  volume set to {v}%"));
-            }
-            _ => {
-                self.shell_history.push("  volume: expected 0-100".into());
-            }
-        }
-    }
-
-    fn cmd_view(&mut self, target: &str) {
-        match target {
-            "tracklist" | "1" => self.active_view = ActiveView::Tracklist,
-            "filesystem" | "2" => self.active_view = ActiveView::Filesystem,
-            "visualizer" | "3" => self.active_view = ActiveView::Visualizer,
-            "settings" | "4" => self.active_view = ActiveView::Settings,
-            "help" | "5" => self.active_view = ActiveView::Help,
-            _ => {
-                self.shell_history
-                    .push(format!("  view: unknown target: {target}"));
-            }
-        }
-    }
-
+    // Helper helpers for duration formatting
     pub fn position_str(&self) -> String {
         format_secs(self.position_secs)
     }
-
     pub fn duration_str(&self) -> String {
         format_secs(self.duration_secs)
     }

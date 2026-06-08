@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Track {
+pub struct LibraryTrack {
     pub id: String, // sha256 of canonical path
     pub path: PathBuf,
     pub name: String,

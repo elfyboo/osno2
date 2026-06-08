@@ -1,5 +1,5 @@
-use crate::library::fs_entry::FsEntry;
-use crate::library::track::Track;
+use crate::fs::fs_entry::FsEntry;
+use crate::library::library_track::LibraryTrack;
 use std::path::PathBuf;
 
 pub enum ViewState {
@@ -8,12 +8,12 @@ pub enum ViewState {
         entries: Vec<FsEntry>,
     },
     Tracklist {
-        tracks: Vec<Track>,
+        tracks: Vec<LibraryTrack>,
         selected: usize,
     },
     Playlist {
         name: String,
-        tracks: Vec<Track>,
+        tracks: Vec<LibraryTrack>,
         selected: usize,
     },
 }

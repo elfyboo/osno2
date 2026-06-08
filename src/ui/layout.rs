@@ -1,9 +1,9 @@
+use crate::ui::app::{ActiveView, App};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Cell, Gauge, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
 };
-
-use crate::ui::app::{ActiveView, App};
+use tui_term::widget::PseudoTerminal;
 
 // Hacker green palette
 const GREEN_BRIGHT: Color = Color::Rgb(0, 255, 70);
@@ -45,14 +45,14 @@ impl AppLayout {
             shell: vertical[4],
         }
     }
-
-    pub fn render(&self, frame: &mut Frame, app: &App) {
+    /// UPDATE: Receives the live raw vt100 virtual screen buffer straight from the worker controller
+    pub fn render(&self, frame: &mut Frame, app: &mut App, vt_screen: &tui_term::vt100::Screen) {
         self.render_header(frame, app);
         self.render_main_view(frame, app);
         self.render_progress(frame, app);
         self.render_fft(frame);
         self.render_metadata(frame, app);
-        self.render_shell(frame, app);
+        self.render_shell(frame, vt_screen); // UPDATE: Routed to terminal widget execution layer
     }
 
     fn render_header(&self, frame: &mut Frame, app: &App) {
@@ -127,10 +127,18 @@ impl AppLayout {
 
                 let marker = if is_playing { "▶" } else { " " };
 
+                let duration_str = format!(
+                    "{:02}:{:02}",
+                    track.duration_secs / 60,
+                    track.duration_secs % 60
+                );
+                let year_str = track.year.map(|y| format!("({y})")).unwrap_or_default();
+
+                // UPDATE: Fixed missing parenthesis structural syntax bug
                 Row::new(vec![
                     Cell::from(marker),
-                    Cell::from(track.length.clone()),
-                    Cell::from(format!("{} ({})", track.name, track.year)),
+                    Cell::from(duration_str),
+                    Cell::from(format!("{} {}", track.name, year_str)),
                     Cell::from(track.artist.clone()),
                     Cell::from(track.ext.clone()),
                 ])
@@ -166,6 +174,7 @@ impl AppLayout {
         let inner = block.inner(self.main_view);
         frame.render_widget(block, self.main_view);
 
+        // UPDATE: Adjusted to iterate over our rich structural FsEntry objects seamlessly
         let entries: Vec<Line> = app
             .fs_entries
             .iter()
@@ -173,10 +182,19 @@ impl AppLayout {
             .map(|(i, entry)| {
                 let style = if i == app.fs_selected {
                     Style::default().fg(GREEN_BRIGHT).bg(GREEN_DARK)
+                } else if entry.is_dir {
+                    Style::default().fg(GREEN_BRIGHT) // Highlight directories clearly
                 } else {
                     Style::default().fg(GREEN_DIM)
                 };
-                Line::styled(format!(" {entry}"), style)
+
+                let display_name = if entry.is_dir {
+                    format!("{}/", entry.name)
+                } else {
+                    entry.name.clone()
+                };
+
+                Line::styled(format!(" {display_name}"), style)
             })
             .collect();
 
@@ -366,39 +384,19 @@ impl AppLayout {
         );
     }
 
-    fn render_shell(&self, frame: &mut Frame, app: &App) {
+    /// UPDATE: Replaces old custom paragraph rendering with the live tui-term widget.
+    /// This hooks the native host pseudo-terminal directly into your layout tree grid canvas.
+    fn render_shell(&self, frame: &mut Frame, vt_screen: &tui_term::vt100::Screen) {
         let block = Block::bordered()
-            .title(format!(" {} ", app.working_dir.display()))
-            .title_style(Style::default().fg(GREEN_DIM))
+            .title(" OS INTERACTIVE CONSOLE (Ctrl+T) ")
+            .title_style(Style::default().fg(GREEN_BRIGHT).bold())
             .border_style(Style::default().fg(GREEN_DIM))
             .style(Style::default().bg(BG_BLACK));
 
-        let inner = block.inner(self.shell);
-        frame.render_widget(block, self.shell);
+        // 0.2.0 UPDATE FIX: Initialize the modern widget wrapper pointing to our screen state
+        let terminal_widget = PseudoTerminal::new(vt_screen).block(block);
 
-        let history_height = inner.height.saturating_sub(1) as usize;
-
-        let visible_history: Vec<Line> = app
-            .shell_history
-            .iter()
-            .rev()
-            .take(history_height)
-            .rev()
-            .map(|line| Line::styled(format!(" {line}"), Style::default().fg(GREEN_DIM)))
-            .collect();
-
-        let prompt = Line::styled(
-            format!(" {}/ {}_", app.working_dir.display(), app.shell_input),
-            Style::default().fg(GREEN_BRIGHT),
-        );
-
-        let mut lines = visible_history;
-        lines.push(prompt);
-
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(BG_BLACK)),
-            inner,
-        );
+        frame.render_widget(terminal_widget, self.shell);
     }
 }
 

@@ -27,6 +27,14 @@ directories = "6.0.0"
 which = "8.0.2"
 opaline = "0.4.1"
 redb = "4.1.0"
+jwalk = "0.8.1"
+dunce = "1.0.5"
+notify = "8.2.0"
+mime_guess = "2.0.5"
+tui-term = "0.3.4"
+sha2 = "0.11.0"
+ringbuf = "0.5.0"
+parking_lot = "0.12.5"
 
 [profile.release]
 opt-level = 3

@@ -1,6 +1,8 @@
 mod config;
+pub mod fs;
 mod launcher;
 pub mod library;
+pub mod spoofed;
 pub mod ui;
 mod worker;
 
