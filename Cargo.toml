@@ -25,6 +25,8 @@ directories = "6.0.0"
 
 # WezTerm process spawning & PATH resolution
 which = "8.0.2"
+opaline = "0.4.1"
+redb = "4.1.0"
 
 [profile.release]
 opt-level = 3

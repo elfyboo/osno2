@@ -1,5 +1,6 @@
 mod config;
 mod launcher;
+pub mod library;
 pub mod ui;
 mod worker;
 
