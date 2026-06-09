@@ -4,7 +4,7 @@ use symphonia::core::codecs::subtitle::well_known as subtitle_codecs;
 use symphonia::core::codecs::video::well_known as video_codecs;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub enum TrackType {
+pub enum LibraryTrackType {
     Audio,
     Video,
     Subtitle,
@@ -12,7 +12,7 @@ pub enum TrackType {
 
 pub struct CodecInformation {
     pub codec_id: CodecId,
-    pub track_type: TrackType,
+    pub track_type: LibraryTrackType,
     pub str_codec_id: &'static str,
     pub str_track_type: &'static str,
 }
@@ -97,7 +97,7 @@ pub fn get_codec_info(codec_id: &CodecId) -> Option<CodecInformation> {
             };
             Some(CodecInformation {
                 codec_id: *codec_id,
-                track_type: TrackType::Audio,
+                track_type: LibraryTrackType::Audio,
                 str_codec_id: name,
                 str_track_type: "audio",
             })
@@ -150,7 +150,7 @@ pub fn get_codec_info(codec_id: &CodecId) -> Option<CodecInformation> {
             };
             Some(CodecInformation {
                 codec_id: *codec_id,
-                track_type: TrackType::Video,
+                track_type: LibraryTrackType::Video,
                 str_codec_id: name,
                 str_track_type: "video",
             })
@@ -174,7 +174,7 @@ pub fn get_codec_info(codec_id: &CodecId) -> Option<CodecInformation> {
             };
             Some(CodecInformation {
                 codec_id: *codec_id,
-                track_type: TrackType::Subtitle,
+                track_type: LibraryTrackType::Subtitle,
                 str_codec_id: name,
                 str_track_type: "subtitle",
             })

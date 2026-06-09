@@ -1,21 +1,17 @@
-use std::fmt::Pointer;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::fs::fs_entry::{FsEntry, FsEntryKind};
+use crate::library::library_playlist::LibraryPlaylist;
+use crate::library::library_track::LibraryTrack;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
-use sha2::Digest;
-use symphonia::core::common::probe::Hint;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia_core::formats::probe;
+use symphonia_core::formats::TrackType;
+use symphonia_core::formats::probe::Hint;
 use symphonia_core::meta::StandardTag;
-
-use crate::fs::fs_entry::{FsEntry, FsEntryKind};
-use crate::library::library_meta::{CodecInformation, TrackType, get_codec_info};
-use crate::library::library_playlist::LibraryPlaylist;
-use crate::library::library_track::LibraryTrack;
 const TRACKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tracks");
 
 pub struct LibraryService {
@@ -77,33 +73,35 @@ impl LibraryService {
         let mut duration_secs: u64 = 0;
         let mut sample_rate: Option<u32> = None;
         let mut bitrate: Option<u32> = None;
-        let mut codec_info: Option<CodecInformation> = None;
         let mut codec_name: Option<String> = None;
 
-        // 2. Fetch ONLY the primary Audio track, ignoring video/thumbnail tracks
+        // fetch audio track
         if let Some(track) = format_reader.default_track(TrackType::Audio) {
-            let params = &track.codec_params;
-            sample_rate = params.sample_rate;
+            if let Some(params) = track.codec_params.clone() {
+                if params.is_audio() {
+                    if let Some(audio_params) = params.audio() {
+                        sample_rate = audio_params.sample_rate;
 
-            // 3. Utilize your new custom helper module to cleanly identify the codec!
-            codec_info = get_codec_info(&params.codec);
-            if let Some(info) = &codec_info {
-                codec_name = Some(info.str_codec_id.to_string());
-            }
+                        if let (Some(frames), Some(sample_rate)) =
+                            (track.num_frames, audio_params.sample_rate)
+                        {
+                            duration_secs = (frames as f64 / sample_rate as f64) as u64;
+                        } else {
+                            duration_secs = 0;
+                        }
 
-            if let (Some(n_frames), Some(tb)) = (params.n_frames, params.time_base) {
-                let time = tb.calc_time(n_frames);
-                duration_secs = time.seconds;
-            }
+                        bitrate = audio_params.bits_per_sample.or_else(|| {
+                            if duration_secs > 0 {
+                                Some(((size_bytes * 8) / duration_secs) as u32)
+                            } else {
+                                None
+                            }
+                        });
 
-            // Estimate streaming bitrate if symphonia doesn't explicitly expose it
-            bitrate = params.bits_per_sample.or_else(|| {
-                if duration_secs > 0 {
-                    Some(((size_bytes * 8) / duration_secs) as u32)
-                } else {
-                    None
+                        codec_name = Some(audio_params.codec.to_string());
+                    }
                 }
-            });
+            }
         }
 
         // 4. Extract Text Tags (Artist, Album, Title, Year)
@@ -112,7 +110,7 @@ impl LibraryService {
         let mut album = "Unknown Album".to_string();
         let mut year: Option<u16> = None;
 
-        if let Some(&metadata) = format_reader.metadata().current() {
+        if let Some(metadata) = format_reader.metadata().current() {
             for tag in metadata.clone().media.tags {
                 if let Some(std_key) = tag.clone().std {
                     match std_key {
