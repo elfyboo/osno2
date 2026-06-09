@@ -1,7 +1,7 @@
 use crate::ui::app::{ActiveView, App};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
+    widgets::{Block, Cell, Gauge, Paragraph, Row, Table},
 };
 use tui_term::widget::PseudoTerminal;
 

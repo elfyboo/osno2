@@ -1,4 +1,3 @@
-// src/worker.rs
 use ansi_control_codes::c0::{CR, ESC, HT};
 use ansi_control_codes::control_sequences::{CNL, CPL, CUB, CUD, CUF, CUU};
 use std::sync::LazyLock;
@@ -20,6 +19,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+
 use parking_lot::RwLock;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use ratatui::prelude::*;
@@ -109,16 +109,19 @@ fn event_loop(
     ]);
 
     let _child = pty_pair.slave.spawn_command(cmd)?;
+
     let mut pty_writer = pty_pair.master.take_writer()?;
+
     let pty_reader = pty_pair.master.try_clone_reader()?;
 
     // Initialize the vt100 Parser state machine.
     // Arguments: (rows, cols, scrollback_lines) -> 1000 lines of scrollback memory
     let vt_parser = Arc::new(RwLock::new(Parser::new(size.height, size.width, 1000)));
 
-    // Background Worker Thread: Pipe stdout directly into the vt100 parser
     let vt_writer_clone = Arc::clone(&vt_parser);
+
     let tx_terminal = event_tx.clone();
+
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(pty_reader);
         let mut buffer = [0u8; 8192];
@@ -134,6 +137,7 @@ fn event_loop(
     });
 
     let tx_crossterm = event_tx.clone();
+
     std::thread::spawn(move || {
         loop {
             if let Ok(true) = event::poll(std::time::Duration::from_millis(200)) {
@@ -153,16 +157,16 @@ fn event_loop(
     });
 
     let mut app = App::new();
+
     let mut current_focus = InputFocus::App;
 
     if let Ok(entries) = library_service.read_dir(&app.working_dir) {
         app.fs_entries = entries;
     }
 
-    // 0.2.0 FIX: Pass the parsed .screen() down to the UI drawing layer
     terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
 
-    for event in event_rx {
+    for event in event_rx.clone() {
         match event {
             AppEvent::TerminalOutput => {
                 if event_rx.is_empty() {
@@ -170,27 +174,21 @@ fn event_loop(
                 }
             }
             AppEvent::Resize(cols, rows) => {
+                // Tell the OS/PTY the terminal size changed
                 let _ = pty_pair.master.resize(PtySize {
                     rows,
                     cols,
                     pixel_width: 0,
                     pixel_height: 0,
                 });
-                // todo, persist scrollback history on resize
-                // let scrollback: Vec<u8> = {
-                //     let guard = vt_parser.read();
-                //     let screen = guard.screen();
-                //     // Reconstruct visible content as bytes to replay into new parser
-                //     (0..screen.rows())
-                //         .flat_map(|row| {
-                //             let mut line = screen.row_contents(row);
-                //             line.push(b'\n');
-                //             line
-                //         })
-                //         .collect()
-                // };
-                let mut new_parser = Parser::new(rows, cols, 1000);
-                // new_parser.process(&scrollback);
+
+                let mut parser_guard = vt_parser.write();
+                *parser_guard = Parser::new(rows, cols, 1000);
+
+                // Drop the guard immediately after re-assigning
+                drop(parser_guard);
+
+                // 3. Draw
                 terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
             }
             AppEvent::KeyEvent(key) => {

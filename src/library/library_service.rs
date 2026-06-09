@@ -146,6 +146,7 @@ impl LibraryService {
             added_at,
         })
     }
+
     pub fn read_dir(&self, path: &Path) -> Result<Vec<FsEntry>, std::io::Error> {
         let mut entries: Vec<FsEntry> = std::fs::read_dir(path)?
             .filter_map(|e| e.ok())
