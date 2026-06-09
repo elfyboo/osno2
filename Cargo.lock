@@ -1553,6 +1553,7 @@ dependencies = [
  "symphonia-core",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
+ "tui-slider",
  "tui-term",
  "vt100",
  "which",
@@ -2744,6 +2745,17 @@ checksum = "1ad61aed86bc3faea4300c7aee358b4c6d0c8d6ccc36524c96e4c92ccf26e77e"
 dependencies = [
  "num-integer",
  "strength_reduce",
+]
+
+[[package]]
+name = "tui-slider"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f76c70800086b617c58a229855b8188c4a3782116fd31d963e41a42f0c7d0209"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "unicode-width",
 ]
 
 [[package]]

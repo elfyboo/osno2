@@ -275,7 +275,7 @@ fn execute_app_command(
         ["volume", level] => {
             if let Ok(v) = level.parse::<u8>() {
                 if v <= 100 {
-                    app.volume = v;
+                    app.volume_state.set_from_position(v as u16, 100);
                 }
             }
         }

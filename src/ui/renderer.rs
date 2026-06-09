@@ -3,6 +3,8 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Cell, Gauge, Paragraph, Row, Table},
 };
+use tui_slider::Slider;
+use tui_slider::style::SliderStyle;
 use tui_term::widget::PseudoTerminal;
 
 // Hacker green palette
@@ -66,7 +68,7 @@ impl AppLayout {
         frame.render_widget(block, area);
 
         let now_playing = format!(" Playing: {}", app.now_playing);
-        let vol_label = format!("vol {}% [osno2] ", app.volume);
+        let vol_label = format!("vol {:?}% [osno2] ", app.volume_state.value());
 
         let header_cols = Layout::horizontal([
             Constraint::Min(0),
@@ -85,6 +87,13 @@ impl AppLayout {
                 .style(Style::default().fg(GREEN_DIM).bg(BG_BLACK)),
             header_cols[1],
         );
+
+        let style = SliderStyle::minimal();
+        let slider = Slider::from_state(&app.volume_state)
+            .filled_color(style.filled_color)
+            .filled_symbol(style.filled_symbol);
+
+        frame.render_widget(slider, header_cols[1]);
     }
 
     fn render_main_view(&self, frame: &mut Frame, app: &App) {

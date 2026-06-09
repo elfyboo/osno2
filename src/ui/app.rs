@@ -2,9 +2,10 @@
 use crate::fs::fs_entry::FsEntry;
 use crate::library::library_track::LibraryTrack;
 use crate::spoofed::spoof_track_meta::TrackMeta;
-use crate::ui::layout::AppLayout;
+use crate::ui::renderer::AppLayout;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
+use tui_slider::SliderState;
 
 #[derive(Default, PartialEq, Debug, Clone, Copy)]
 pub enum ActiveView {
@@ -29,7 +30,7 @@ pub struct App {
 
     // Playback state
     pub now_playing: String,
-    pub volume: u8,
+    //pub volume: u8,
     pub position_secs: u64,
     pub duration_secs: u64,
     pub playing_track: usize,
@@ -41,9 +42,12 @@ pub struct App {
     // Metadata panel
     pub track_meta: TrackMeta,
 
-    // Filesystem view (State only!)
+    // Slider panel
+    pub volume_state: SliderState,
+
+    // Filesystem view [State only]
     pub working_dir: PathBuf,
-    pub fs_entries: Vec<FsEntry>, // Uses our clean model, not raw strings
+    pub fs_entries: Vec<FsEntry>,
     pub fs_selected: usize,
 
     // Sandboxed Application REPL History
@@ -55,10 +59,11 @@ impl App {
     pub fn new() -> Self {
         // Initialize with default state or empty vectors.
         // Your background engine will populate these asynchronously via workers later.
+        let state = SliderState::new(50.0, 0.0, 100.0);
         Self {
             active_view: ActiveView::default(),
-            now_playing: "No Track Playing".into(),
-            volume: 100,
+            now_playing: "[No Track Playing]".into(),
+            volume_state: state,
             position_secs: 0,
             duration_secs: 0,
             playing_track: 0,
