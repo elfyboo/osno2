@@ -1,7 +1,7 @@
 use crate::ui::app::{ActiveView, App};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Cell, Gauge, Paragraph, Row, Table},
+    widgets::{Block, Cell, Gauge, Padding, Paragraph, Row, Table},
 };
 use tui_slider::Slider;
 use tui_slider::style::SliderStyle;
@@ -63,7 +63,7 @@ impl AppLayout {
         let snackbar_right = snackbar_cols[1];
 
         let right_rows = Layout::vertical([
-            Constraint::Length(3), // duration / progress bar
+            Constraint::Length(1), // duration / progress bar
             Constraint::Min(0),    // metadata grid
         ])
         .split(snackbar_right);
@@ -322,8 +322,6 @@ impl AppLayout {
         );
     }
 
-    /// Renders the unified snackbar: thumbnail slot (left) + duration/metadata (right),
-    /// all within a single untitled bordered container.
     fn render_snackbar(&self, frame: &mut Frame, app: &App) {
         let block = Block::bordered()
             .border_style(Style::default().fg(BORDER_DIM))
@@ -332,14 +330,16 @@ impl AppLayout {
         let inner = block.inner(self.snackbar);
         frame.render_widget(block, self.snackbar);
 
-        // Re-split the inner area to avoid double borders between thumbnail and right side.
         let inner_cols =
             Layout::horizontal([Constraint::Length(self.thumbnail.width), Constraint::Min(0)])
                 .split(inner);
 
+        // 1-cell gap between thumbnail and the right column
+        let right_block = Block::default().padding(Padding::left(1));
+        let right_area = right_block.inner(inner_cols[1]);
+
         let inner_right =
-            Layout::vertical([Constraint::Length(self.progress.height), Constraint::Min(0)])
-                .split(inner_cols[1]);
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(right_area);
 
         self.render_thumbnail(frame, inner_cols[0]);
         self.render_progress(frame, app, inner_right[0]);
@@ -358,15 +358,7 @@ impl AppLayout {
     }
 
     fn render_progress(&self, frame: &mut Frame, app: &App, area: Rect) {
-        let label = format!(" {} / {} ", app.position_str(), app.duration_str());
-
-        let cols = Layout::horizontal([Constraint::Length(label.len() as u16), Constraint::Min(0)])
-            .split(area);
-
-        frame.render_widget(
-            Paragraph::new(label).style(Style::default().fg(FG_ACCENT).bg(BG_BLACK)),
-            cols[0],
-        );
+        let label = format!("{} / {}", app.position_str(), app.duration_str());
 
         let ratio = if app.duration_secs > 0 {
             (app.position_secs as f64 / app.duration_secs as f64).clamp(0.0, 1.0)
@@ -377,12 +369,15 @@ impl AppLayout {
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(FG_BRIGHT).bg(BG_FILL))
             .ratio(ratio)
-            .label("");
+            .label(Span::styled(label, Style::default().fg(FG_ACCENT)));
 
-        frame.render_widget(gauge, cols[1]);
+        frame.render_widget(gauge, area);
     }
 
     fn render_metadata(&self, frame: &mut Frame, app: &App, area: Rect) {
+        let block = Block::default().padding(Padding::top(1));
+        let area = block.inner(area);
+
         let cols = Layout::horizontal([
             Constraint::Percentage(33),
             Constraint::Percentage(33),
