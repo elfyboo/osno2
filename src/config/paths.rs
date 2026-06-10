@@ -1,10 +1,11 @@
-use directories::ProjectDirs;
+use directories::{ProjectDirs, UserDirs};
 use std::path::PathBuf;
 
 pub struct AppPaths {
     pub config_dir: PathBuf,
     pub _library_dir: PathBuf,
     pub _playlists_dir: PathBuf,
+    pub _music_root: PathBuf,
 }
 
 impl AppPaths {
@@ -12,6 +13,7 @@ impl AppPaths {
         let config_dir = Self::resolve_config_dir();
         let _library_dir = config_dir.join("library");
         let _playlists_dir = config_dir.join("playlists");
+        let _music_root = Self::resolve_music_root();
 
         std::fs::create_dir_all(&config_dir).expect("Failed to create config directory");
         std::fs::create_dir_all(&_library_dir).expect("Failed to create library directory");
@@ -21,6 +23,7 @@ impl AppPaths {
             config_dir,
             _library_dir,
             _playlists_dir,
+            _music_root,
         }
     }
 
@@ -43,6 +46,12 @@ impl AppPaths {
         }
     }
 
+    fn resolve_music_root() -> PathBuf {
+        UserDirs::new()
+            .and_then(|dirs| dirs.audio_dir().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     pub fn wezterm_config(&self) -> PathBuf {
         self.config_dir.join("wezterm.lua")
     }
@@ -57,5 +66,9 @@ impl AppPaths {
 
     pub fn _tracks_toml(&self) -> PathBuf {
         self._library_dir.join("tracks.toml")
+    }
+
+    pub fn _music_root(&self) -> &PathBuf {
+        &self._music_root
     }
 }

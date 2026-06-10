@@ -1,10 +1,14 @@
+use crate::worker::AppEvent;
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::fs::fs_entry::{FsEntry, FsEntryKind};
 use crate::library::library_playlist::LibraryPlaylist;
 use crate::library::library_track::LibraryTrack;
+use jwalk::WalkDir;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -12,10 +16,13 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia_core::formats::TrackType;
 use symphonia_core::formats::probe::Hint;
 use symphonia_core::meta::StandardTag;
-const TRACKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tracks");
 
+const TRACKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tracks");
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "wav", "m4a", "aac", "opus"];
+
+#[derive(Clone)]
 pub struct LibraryService {
-    db: redb::Database,
+    db: Arc<redb::Database>,
     meta_dir: PathBuf,
     playlists_dir: PathBuf,
 }
@@ -23,11 +30,12 @@ pub struct LibraryService {
 impl LibraryService {
     pub fn new(db: redb::Database, meta_dir: PathBuf, playlists_dir: PathBuf) -> Self {
         Self {
-            db,
+            db: Arc::new(db),
             meta_dir,
             playlists_dir,
         }
     }
+
     fn extract_track_metadata(&self, path: &Path) -> Result<LibraryTrack, std::io::Error> {
         let clean_path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let file = File::open(&clean_path)?;
@@ -68,7 +76,7 @@ impl LibraryService {
                 FormatOptions::default(),
                 MetadataOptions::default(),
             )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?; // We extract the `FormatReader` out of the ProbeResult struct here
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         let mut duration_secs: u64 = 0;
         let mut sample_rate: Option<u32> = None;
@@ -437,5 +445,52 @@ impl LibraryService {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(file_path, toml_str)?;
         Ok(())
+    }
+
+    /// Walks `music_root` for audio files not yet indexed, extracts metadata for
+    /// each, persists it, and emits one `LibraryScanProgress` event per new track.
+    /// Sends `LibraryScanComplete` when the walk finishes.
+    pub async fn scan_library(self, music_root: PathBuf, tx: crossbeam_channel::Sender<AppEvent>) {
+        let known_paths: HashSet<PathBuf> = match self.all_tracks() {
+            Ok(tracks) => tracks.into_iter().map(|t| t.path).collect(),
+            Err(_) => HashSet::new(),
+        };
+
+        let candidates: Vec<PathBuf> = WalkDir::new(&music_root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path())
+            .filter(|p| {
+                let ext = p
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                AUDIO_EXTENSIONS.contains(&ext.as_str())
+            })
+            .filter(|p| {
+                let canonical = dunce::canonicalize(p).unwrap_or_else(|_| p.clone());
+                !known_paths.contains(&canonical)
+            })
+            .collect();
+
+        for path in candidates {
+            let svc = self.clone();
+            let tx = tx.clone();
+
+            let result = tokio::task::spawn_blocking(move || svc.add_track(&path)).await;
+
+            match result {
+                Ok(Err(_)) | Err(_) => {
+                    // Skip unreadable/corrupt files; don't abort the whole scan
+                }
+                Ok(Ok(track)) => {
+                    let _ = tx.send(AppEvent::LibraryScanProgress(track.duration_secs));
+                }
+            }
+        }
+
+        let _ = tx.send(AppEvent::LibraryScanComplete);
     }
 }

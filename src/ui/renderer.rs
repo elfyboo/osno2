@@ -385,30 +385,50 @@ impl AppLayout {
         ])
         .split(area);
 
-        let t = &app.track_meta;
-        let stars = "★".repeat(t.rating) + &"☆".repeat(5_usize.saturating_sub(t.rating));
+        let mut col1 = vec![];
+        let mut col2 = vec![];
+        let mut col3 = vec![];
 
-        let col1 = vec![
-            meta_line("Title", &t.title),
-            meta_line("Artist", &t.artist),
-            meta_line("Album", &t.album),
-            meta_line("Codec", &t.codec),
-        ];
+        if !app.tracks.is_empty() && app.selected_track < app.tracks.len() {
+            let t = &app.tracks[app.selected_track];
 
-        let col2 = vec![
-            meta_line("Track", &t.track_num),
-            meta_line("Genre", &t.genre),
-            meta_line("Time", &t.time),
-            meta_line("Bitrate", &t.bitrate),
-        ];
+            // These strings are created inside the block, but that's fine now!
+            let sr = &t.clone().sample_rate.unwrap_or(0).to_string();
+            let stars = "★".repeat(t.rating as usize)
+                + &"☆".repeat(5_usize.saturating_sub(t.rating as usize));
 
-        let col3 = vec![
-            meta_line("Year", &t.year),
-            meta_line("Size", &t.size),
-            meta_line("Sample Rate", &t.sample_rate),
-            meta_line("Rating", &stars),
-        ];
+            col1 = vec![
+                meta_line("Title", &t.name),
+                meta_line("Artist", &t.artist),
+                meta_line("Album", &t.album),
+                meta_line("Codec", t.codec.as_deref().unwrap_or("N/A")),
+            ];
 
+            col2 = vec![
+                meta_line("Track", "0"),
+                meta_line("Sample Rate", sr),
+                meta_line(
+                    "Bitrate",
+                    &t.bitrate
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "N/A".to_string()),
+                ),
+            ];
+
+            col3 = vec![
+                meta_line("Added", &t.added_at.to_string()),
+                meta_line("Size", &format!("{} bytes", t.size_bytes)),
+                meta_line(
+                    "Year",
+                    &t.year
+                        .map(|y| y.to_string())
+                        .unwrap_or_else(|| "N/A".to_string()),
+                ),
+                meta_line("Rating", &stars),
+            ];
+        }
+
+        // Now this works perfectly because col1, col2, and col3 own their strings!
         frame.render_widget(
             Paragraph::new(col1).style(Style::default().bg(BG_BLACK)),
             cols[0],
@@ -468,7 +488,7 @@ fn render_dot_grid(area: Rect, buckets: &[f32]) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn meta_line<'a>(key: &'a str, value: &'a str) -> Line<'a> {
+fn meta_line(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!(" {key}: "), Style::default().fg(FG_DIM)),
         Span::styled(value.to_string(), Style::default().fg(FG_BRIGHT)),

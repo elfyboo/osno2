@@ -1,8 +1,9 @@
 // src/ui/app.rs
-use crate::fs::fs_entry::FsEntry;
+
+use crate::fs::fs_entry::{FsEntry, FsEntryKind};
 use crate::library::library_track::LibraryTrack;
-use crate::spoofed::spoof_track_meta::TrackMeta;
 use crate::ui::renderer::AppLayout;
+use crossbeam_channel::Receiver;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 use tui_slider::SliderState;
@@ -30,17 +31,14 @@ pub struct App {
 
     // Playback state
     pub now_playing: String,
-    //pub volume: u8,
     pub position_secs: u64,
     pub duration_secs: u64,
     pub playing_track: usize,
     pub selected_track: usize,
 
-    // Track list
+    // Library State
     pub tracks: Vec<LibraryTrack>,
-
-    // Metadata panel
-    pub track_meta: TrackMeta,
+    pub track_receiver: Option<Receiver<Vec<LibraryTrack>>>,
 
     // Slider panel
     pub volume_state: SliderState,
@@ -57,8 +55,6 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        // Initialize with default state or empty vectors.
-        // Your background engine will populate these asynchronously via workers later.
         let state = SliderState::new(50.0, 0.0, 100.0);
         Self {
             active_view: ActiveView::default(),
@@ -69,7 +65,7 @@ impl App {
             playing_track: 0,
             selected_track: 0,
             tracks: Vec::new(),
-            track_meta: TrackMeta::default(),
+            track_receiver: None,
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             fs_entries: Vec::new(),
             fs_selected: 0,
@@ -78,9 +74,39 @@ impl App {
         }
     }
 
+    /// Drains the background library scanner channel for new tracks
+    /// Call this inside your main event loop before rendering.
+    pub fn poll_scanner(&mut self) {
+        if let Some(rx) = &self.track_receiver {
+            let mut new_data = false;
+            while let Ok(mut new_tracks) = rx.try_recv() {
+                self.tracks.append(&mut new_tracks);
+                new_data = true;
+            }
+
+            // Only sort if we actually appended new tracks this tick
+            if new_data {
+                self.tracks.sort_by(|a, b| {
+                    a.artist
+                        .cmp(&b.artist)
+                        .then(a.album.cmp(&b.album))
+                        .then(a.name.cmp(&b.name))
+                });
+            }
+        }
+    }
+
+    /// Kicks off a new background scan and hooks up the receiver
+    pub fn start_library_scan(&mut self, directory: PathBuf) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.track_receiver = Some(rx);
+        self.tracks.clear();
+
+        crate::library::scanner::spawn_library_scan(directory, tx);
+    }
+
     pub fn draw(&mut self, frame: &mut ratatui::Frame, vt_screen: &tui_term::vt100::Screen) {
         let layout = AppLayout::new(frame.area());
-        // Pass the vt_screen straight down to your AppLayout renderer layout module
         layout.render(frame, self, vt_screen);
     }
 
@@ -167,6 +193,8 @@ impl App {
             ActiveView::Tracklist => {
                 if !self.tracks.is_empty() {
                     let track = &self.tracks[self.selected_track];
+                    self.playing_track = self.selected_track;
+                    self.now_playing = format!("{} - {}", track.artist, track.name);
                     AppAction::ExecuteCommand(format!("play {}", track.id))
                 } else {
                     AppAction::None
@@ -175,15 +203,25 @@ impl App {
             ActiveView::Filesystem => {
                 if !self.fs_entries.is_empty() {
                     let entry = &self.fs_entries[self.fs_selected];
-                    AppAction::ExecuteCommand(format!("cd {}", entry.path.display()))
+
+                    match entry.kind {
+                        FsEntryKind::Directory => {
+                            AppAction::ExecuteCommand(format!("cd {}", entry.path.display()))
+                        }
+                        FsEntryKind::AudioFile => {
+                            AppAction::ExecuteCommand(format!("play {}", entry.path.display()))
+                        }
+                        FsEntryKind::File => AppAction::None,
+                    }
                 } else {
                     AppAction::None
                 }
             }
             _ => {
-                // If pressing enter on the sandboxed app REPL command bar
+                // Pressing enter on the sandboxed app REPL command bar
                 let input = self.shell_input.trim().to_string();
                 if !input.is_empty() {
+                    self.shell_history.push(format!("> {}", input));
                     self.shell_input.clear();
                     AppAction::ExecuteCommand(input)
                 } else {
@@ -205,7 +243,7 @@ impl App {
         }
     }
 
-    // Helper helpers for duration formatting
+    // Helper formatting for playback timers
     pub fn position_str(&self) -> String {
         format_secs(self.position_secs)
     }

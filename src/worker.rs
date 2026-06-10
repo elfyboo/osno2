@@ -45,6 +45,8 @@ pub enum AppEvent {
     KeyEvent(KeyEvent),
     TerminalOutput,
     Resize(u16, u16),
+    LibraryScanProgress(u64),
+    LibraryScanComplete,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -191,6 +193,8 @@ fn event_loop(
                 // 3. Draw
                 terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
             }
+            AppEvent::LibraryScanProgress(_progress) => {}
+            AppEvent::LibraryScanComplete => {}
             AppEvent::KeyEvent(key) => {
                 if should_quit(key) {
                     return Ok(());
