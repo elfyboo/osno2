@@ -7,18 +7,32 @@ use tui_slider::Slider;
 use tui_slider::style::SliderStyle;
 use tui_term::widget::PseudoTerminal;
 
-// Hacker green palette
-const GREEN_BRIGHT: Color = Color::Rgb(0, 255, 70);
-const GREEN_DIM: Color = Color::Rgb(0, 180, 50);
-const GREEN_DARK: Color = Color::Rgb(0, 80, 20);
+// Default Terminal Color Palette
+const _PALETTE_0: Color = Color::Rgb(0x33, 0x0d, 0x10); // darkest red-brown
+const PALETTE_1: Color = Color::Rgb(0x4d, 0x13, 0x0f);
+const PALETTE_2: Color = Color::Rgb(0x73, 0x20, 0x17);
+const PALETTE_3: Color = Color::Rgb(0x99, 0x28, 0x17);
+const PALETTE_4: Color = Color::Rgb(0xbf, 0x48, 0x1d);
+const PALETTE_5: Color = Color::Rgb(0xd9, 0x7e, 0x16);
+const _PALETTE_6: Color = Color::Rgb(0xe5, 0xbe, 0x22);
+const PALETTE_7: Color = Color::Rgb(0xf2, 0xe7, 0x49); // brightest yellow
+
+// Semantic aliases mapped onto palette
+const FG_BRIGHT: Color = PALETTE_7;
+const FG_ACCENT: Color = PALETTE_5;
+const FG_DIM: Color = PALETTE_4;
+const BORDER_DIM: Color = PALETTE_2;
 const BG_BLACK: Color = Color::Rgb(5, 5, 5);
-const BG_TRACK_ROW: Color = Color::Rgb(0, 140, 40);
+const BG_TRACK_ROW: Color = PALETTE_3;
+const BG_FILL: Color = PALETTE_1;
 
 pub struct AppLayout {
     pub header: Rect,
     pub main_view: Rect,
+    pub snackbar: Rect,
+    pub thumbnail: Rect,
+    pub snackbar_right: Rect,
     pub progress: Rect,
-    pub fft: Rect,
     pub metadata: Rect,
     pub shell: Rect,
 }
@@ -28,32 +42,49 @@ impl AppLayout {
         let vertical = Layout::vertical([
             Constraint::Length(3), // header
             Constraint::Min(0),    // main view
-            Constraint::Length(3), // progress + fft
-            Constraint::Length(6), // metadata grid
+            Constraint::Length(8), // snackbar (album art / visualizer + duration + metadata)
             Constraint::Length(6), // shell
         ])
         .split(area);
 
-        let progress_row =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(vertical[2]);
+        let snackbar = vertical[2];
+
+        // Square thumbnail slot on the left, sized to the snackbar's inner height.
+        // Block border consumes 2 rows/cols; terminal cells are ~2:1 (h:w), so
+        // width = 2 * inner_height keeps the slot visually square.
+        let inner_height = snackbar.height.saturating_sub(2);
+        let thumbnail_width = (inner_height * 2).clamp(1, snackbar.width.saturating_sub(1));
+
+        let snackbar_cols =
+            Layout::horizontal([Constraint::Length(thumbnail_width), Constraint::Min(0)])
+                .split(snackbar);
+
+        let thumbnail = snackbar_cols[0];
+        let snackbar_right = snackbar_cols[1];
+
+        let right_rows = Layout::vertical([
+            Constraint::Length(3), // duration / progress bar
+            Constraint::Min(0),    // metadata grid
+        ])
+        .split(snackbar_right);
 
         Self {
             header: vertical[0],
             main_view: vertical[1],
-            progress: progress_row[0],
-            fft: progress_row[1],
-            metadata: vertical[3],
-            shell: vertical[4],
+            snackbar,
+            thumbnail,
+            snackbar_right,
+            progress: right_rows[0],
+            metadata: right_rows[1],
+            shell: vertical[3],
         }
     }
+
     /// UPDATE: Receives the live raw vt100 virtual screen buffer straight from the worker controller
     pub fn render(&self, frame: &mut Frame, app: &mut App, vt_screen: &tui_term::vt100::Screen) {
         self.render_header(frame, app);
         self.render_main_view(frame, app);
-        self.render_progress(frame, app);
-        self.render_fft(frame);
-        self.render_metadata(frame, app);
+        self.render_snackbar(frame, app);
         self.render_shell(frame, vt_screen); // UPDATE: Routed to terminal widget execution layer
     }
 
@@ -61,7 +92,7 @@ impl AppLayout {
         let area = self.header;
 
         let block = Block::bordered()
-            .border_style(Style::default().fg(GREEN_DIM))
+            .border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_BLACK));
 
         let inner = block.inner(area);
@@ -77,14 +108,14 @@ impl AppLayout {
         .split(inner);
 
         frame.render_widget(
-            Paragraph::new(now_playing).style(Style::default().fg(GREEN_BRIGHT).bg(BG_BLACK)),
+            Paragraph::new(now_playing).style(Style::default().fg(FG_BRIGHT).bg(BG_BLACK)),
             header_cols[0],
         );
 
         frame.render_widget(
             Paragraph::new(vol_label)
                 .alignment(Alignment::Right)
-                .style(Style::default().fg(GREEN_DIM).bg(BG_BLACK)),
+                .style(Style::default().fg(FG_DIM).bg(BG_BLACK)),
             header_cols[1],
         );
 
@@ -111,8 +142,8 @@ impl AppLayout {
 
         let block = Block::bordered()
             .title(" tracklist ")
-            .title_style(Style::default().fg(GREEN_BRIGHT))
-            .border_style(Style::default().fg(GREEN_DIM))
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_TRACK_ROW));
 
         let inner = block.inner(area);
@@ -127,9 +158,9 @@ impl AppLayout {
                 let is_selected = i == app.selected_track;
 
                 let row_style = if is_playing {
-                    Style::default().fg(GREEN_BRIGHT).bg(BG_BLACK)
+                    Style::default().fg(FG_BRIGHT).bg(BG_BLACK)
                 } else if is_selected {
-                    Style::default().fg(GREEN_BRIGHT).bg(GREEN_DARK)
+                    Style::default().fg(FG_BRIGHT).bg(BG_FILL)
                 } else {
                     Style::default().fg(BG_BLACK).bg(BG_TRACK_ROW)
                 };
@@ -143,7 +174,6 @@ impl AppLayout {
                 );
                 let year_str = track.year.map(|y| format!("({y})")).unwrap_or_default();
 
-                // UPDATE: Fixed missing parenthesis structural syntax bug
                 Row::new(vec![
                     Cell::from(marker),
                     Cell::from(duration_str),
@@ -166,7 +196,7 @@ impl AppLayout {
         let table = Table::new(rows, widths)
             .header(
                 Row::new(vec!["", "len", "title", "artist", "type"])
-                    .style(Style::default().fg(GREEN_BRIGHT).bg(GREEN_DARK).bold()),
+                    .style(Style::default().fg(FG_BRIGHT).bg(BG_FILL).bold()),
             )
             .column_spacing(2);
 
@@ -176,25 +206,24 @@ impl AppLayout {
     fn render_filesystem(&self, frame: &mut Frame, app: &App) {
         let block = Block::bordered()
             .title(format!(" {} ", app.working_dir.display()))
-            .title_style(Style::default().fg(GREEN_BRIGHT))
-            .border_style(Style::default().fg(GREEN_DIM))
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_BLACK));
 
         let inner = block.inner(self.main_view);
         frame.render_widget(block, self.main_view);
 
-        // UPDATE: Adjusted to iterate over our rich structural FsEntry objects seamlessly
         let entries: Vec<Line> = app
             .fs_entries
             .iter()
             .enumerate()
             .map(|(i, entry)| {
                 let style = if i == app.fs_selected {
-                    Style::default().fg(GREEN_BRIGHT).bg(GREEN_DARK)
+                    Style::default().fg(FG_BRIGHT).bg(BG_FILL)
                 } else if entry.is_dir {
-                    Style::default().fg(GREEN_BRIGHT) // Highlight directories clearly
+                    Style::default().fg(FG_BRIGHT)
                 } else {
-                    Style::default().fg(GREEN_DIM)
+                    Style::default().fg(FG_DIM)
                 };
 
                 let display_name = if entry.is_dir {
@@ -216,8 +245,8 @@ impl AppLayout {
     fn render_visualizer_fullscreen(&self, frame: &mut Frame) {
         let block = Block::bordered()
             .title(" visualizer ")
-            .title_style(Style::default().fg(GREEN_BRIGHT))
-            .border_style(Style::default().fg(GREEN_DIM))
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_BLACK));
 
         let inner = block.inner(self.main_view);
@@ -233,13 +262,13 @@ impl AppLayout {
     fn render_settings(&self, frame: &mut Frame) {
         let block = Block::bordered()
             .title(" settings ")
-            .title_style(Style::default().fg(GREEN_BRIGHT))
-            .border_style(Style::default().fg(GREEN_DIM))
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_BLACK));
 
         frame.render_widget(
             Paragraph::new(" settings not yet implemented")
-                .style(Style::default().fg(GREEN_DIM).bg(BG_BLACK))
+                .style(Style::default().fg(FG_DIM).bg(BG_BLACK))
                 .block(block),
             self.main_view,
         );
@@ -247,48 +276,42 @@ impl AppLayout {
 
     fn render_help(&self, frame: &mut Frame) {
         let content = vec![
-            Line::styled(" keybindings", Style::default().fg(GREEN_BRIGHT).bold()),
+            Line::styled(" keybindings", Style::default().fg(FG_BRIGHT).bold()),
             Line::raw(""),
-            Line::styled(" Alt+1   tracklist", Style::default().fg(GREEN_DIM)),
-            Line::styled(" Alt+2   filesystem", Style::default().fg(GREEN_DIM)),
-            Line::styled(" Alt+3   visualizer", Style::default().fg(GREEN_DIM)),
-            Line::styled(" Alt+4   settings", Style::default().fg(GREEN_DIM)),
-            Line::styled(" Alt+5   help", Style::default().fg(GREEN_DIM)),
+            Line::styled(" Alt+1   tracklist", Style::default().fg(FG_DIM)),
+            Line::styled(" Alt+2   filesystem", Style::default().fg(FG_DIM)),
+            Line::styled(" Alt+3   visualizer", Style::default().fg(FG_DIM)),
+            Line::styled(" Alt+4   settings", Style::default().fg(FG_DIM)),
+            Line::styled(" Alt+5   help", Style::default().fg(FG_DIM)),
             Line::raw(""),
-            Line::styled(" shell commands", Style::default().fg(GREEN_BRIGHT).bold()),
+            Line::styled(" shell commands", Style::default().fg(FG_BRIGHT).bold()),
             Line::raw(""),
             Line::styled(
                 " cd <path>        change directory",
-                Style::default().fg(GREEN_DIM),
+                Style::default().fg(FG_DIM),
             ),
             Line::styled(
                 " ls               list directory",
-                Style::default().fg(GREEN_DIM),
+                Style::default().fg(FG_DIM),
             ),
-            Line::styled(
-                " play <query>     play track",
-                Style::default().fg(GREEN_DIM),
-            ),
+            Line::styled(" play <query>     play track", Style::default().fg(FG_DIM)),
             Line::styled(
                 " queue <query>    add to queue",
-                Style::default().fg(GREEN_DIM),
+                Style::default().fg(FG_DIM),
             ),
-            Line::styled(
-                " volume <0-100>   set volume",
-                Style::default().fg(GREEN_DIM),
-            ),
+            Line::styled(" volume <0-100>   set volume", Style::default().fg(FG_DIM)),
             Line::styled(
                 " purge            clear library index",
-                Style::default().fg(GREEN_DIM),
+                Style::default().fg(FG_DIM),
             ),
             Line::raw(""),
-            Line::styled(" q / Ctrl+C       quit", Style::default().fg(GREEN_DIM)),
+            Line::styled(" q / Ctrl+C       quit", Style::default().fg(FG_DIM)),
         ];
 
         let block = Block::bordered()
             .title(" help ")
-            .title_style(Style::default().fg(GREEN_BRIGHT))
-            .border_style(Style::default().fg(GREEN_DIM))
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_BLACK));
 
         frame.render_widget(
@@ -299,12 +322,51 @@ impl AppLayout {
         );
     }
 
-    fn render_progress(&self, frame: &mut Frame, app: &App) {
+    /// Renders the unified snackbar: thumbnail slot (left) + duration/metadata (right),
+    /// all within a single untitled bordered container.
+    fn render_snackbar(&self, frame: &mut Frame, app: &App) {
         let block = Block::bordered()
-            .title(format!(" {} / {} ", app.position_str(), app.duration_str()))
-            .title_style(Style::default().fg(GREEN_DIM))
-            .border_style(Style::default().fg(GREEN_DIM))
+            .border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_BLACK));
+
+        let inner = block.inner(self.snackbar);
+        frame.render_widget(block, self.snackbar);
+
+        // Re-split the inner area to avoid double borders between thumbnail and right side.
+        let inner_cols =
+            Layout::horizontal([Constraint::Length(self.thumbnail.width), Constraint::Min(0)])
+                .split(inner);
+
+        let inner_right =
+            Layout::vertical([Constraint::Length(self.progress.height), Constraint::Min(0)])
+                .split(inner_cols[1]);
+
+        self.render_thumbnail(frame, inner_cols[0]);
+        self.render_progress(frame, app, inner_right[0]);
+        self.render_metadata(frame, app, inner_right[1]);
+    }
+
+    /// Square slot showing either the spectrum visualizer or album art thumbnail.
+    /// Currently always renders the visualizer placeholder; swap on `app` state
+    /// once album art loading lands.
+    fn render_thumbnail(&self, frame: &mut Frame, area: Rect) {
+        let dots = render_dot_grid(area, &[]);
+        frame.render_widget(
+            Paragraph::new(dots).style(Style::default().bg(BG_BLACK)),
+            area,
+        );
+    }
+
+    fn render_progress(&self, frame: &mut Frame, app: &App, area: Rect) {
+        let label = format!(" {} / {} ", app.position_str(), app.duration_str());
+
+        let cols = Layout::horizontal([Constraint::Length(label.len() as u16), Constraint::Min(0)])
+            .split(area);
+
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(FG_ACCENT).bg(BG_BLACK)),
+            cols[0],
+        );
 
         let ratio = if app.duration_secs > 0 {
             (app.position_secs as f64 / app.duration_secs as f64).clamp(0.0, 1.0)
@@ -313,47 +375,20 @@ impl AppLayout {
         };
 
         let gauge = Gauge::default()
-            .block(block)
-            .gauge_style(Style::default().fg(GREEN_BRIGHT).bg(GREEN_DARK))
+            .gauge_style(Style::default().fg(FG_BRIGHT).bg(BG_FILL))
             .ratio(ratio)
             .label("");
 
-        frame.render_widget(gauge, self.progress);
+        frame.render_widget(gauge, cols[1]);
     }
 
-    fn render_fft(&self, frame: &mut Frame) {
-        let block = Block::bordered()
-            .title(" spectrum ")
-            .title_style(Style::default().fg(GREEN_DIM))
-            .border_style(Style::default().fg(GREEN_DIM))
-            .style(Style::default().bg(BG_BLACK));
-
-        let inner = block.inner(self.fft);
-        frame.render_widget(block, self.fft);
-
-        let dots = render_dot_grid(inner, &[]);
-        frame.render_widget(
-            Paragraph::new(dots).style(Style::default().bg(BG_BLACK)),
-            inner,
-        );
-    }
-
-    fn render_metadata(&self, frame: &mut Frame, app: &App) {
-        let block = Block::bordered()
-            .title(" metadata ")
-            .title_style(Style::default().fg(GREEN_DIM))
-            .border_style(Style::default().fg(GREEN_DIM))
-            .style(Style::default().bg(BG_BLACK));
-
-        let inner = block.inner(self.metadata);
-        frame.render_widget(block, self.metadata);
-
+    fn render_metadata(&self, frame: &mut Frame, app: &App, area: Rect) {
         let cols = Layout::horizontal([
             Constraint::Percentage(33),
             Constraint::Percentage(33),
             Constraint::Percentage(34),
         ])
-        .split(inner);
+        .split(area);
 
         let t = &app.track_meta;
         let stars = "★".repeat(t.rating) + &"☆".repeat(5_usize.saturating_sub(t.rating));
@@ -394,23 +429,19 @@ impl AppLayout {
     }
 
     /// UPDATE: Replaces old custom paragraph rendering with the live tui-term widget.
-    /// This hooks the native host pseudo-terminal directly into your layout tree grid canvas.
     fn render_shell(&self, frame: &mut Frame, vt_screen: &tui_term::vt100::Screen) {
         let block = Block::bordered()
             .title(" OS INTERACTIVE CONSOLE (Ctrl+T) ")
-            .title_style(Style::default().fg(GREEN_BRIGHT).bold())
-            .border_style(Style::default().fg(GREEN_DIM))
+            .title_style(Style::default().fg(FG_BRIGHT).bold())
+            .border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_BLACK));
 
-        // 0.2.0 UPDATE FIX: Initialize the modern widget wrapper pointing to our screen state
         let terminal_widget = PseudoTerminal::new(vt_screen).block(block);
 
         frame.render_widget(terminal_widget, self.shell);
     }
 }
 
-// `buckets` is a slice of f32 in [0.0, 1.0] per frequency band.
-// Empty slice renders a static placeholder grid.
 fn render_dot_grid(area: Rect, buckets: &[f32]) -> Vec<Line<'static>> {
     let cols = area.width as usize;
     let rows = area.height as usize;
@@ -430,9 +461,9 @@ fn render_dot_grid(area: Rect, buckets: &[f32]) -> Vec<Line<'static>> {
                     let lit = magnitude >= threshold;
 
                     if lit {
-                        Span::styled("•", Style::default().fg(GREEN_BRIGHT))
+                        Span::styled("•", Style::default().fg(FG_BRIGHT))
                     } else {
-                        Span::styled("·", Style::default().fg(GREEN_DARK))
+                        Span::styled("·", Style::default().fg(BORDER_DIM))
                     }
                 })
                 .collect();
@@ -444,7 +475,7 @@ fn render_dot_grid(area: Rect, buckets: &[f32]) -> Vec<Line<'static>> {
 
 fn meta_line<'a>(key: &'a str, value: &'a str) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!(" {key}: "), Style::default().fg(GREEN_DIM)),
-        Span::styled(value.to_string(), Style::default().fg(GREEN_BRIGHT)),
+        Span::styled(format!(" {key}: "), Style::default().fg(FG_DIM)),
+        Span::styled(value.to_string(), Style::default().fg(FG_BRIGHT)),
     ])
 }

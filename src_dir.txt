@@ -1,0 +1,31 @@
+.
+├── audio
+│   └── mod.rs
+├── config
+│   ├── mod.rs
+│   └── paths.rs
+├── fs
+│   ├── fs_entry.rs
+│   └── mod.rs
+├── ipc
+│   └── mod.rs
+├── launcher.rs
+├── library
+│   ├── library_meta.rs
+│   ├── library_playlist.rs
+│   ├── library_service.rs
+│   ├── library_track.rs
+│   └── mod.rs
+├── main.rs
+├── spoofed
+│   ├── mod.rs
+│   └── spoof_track_meta.rs
+├── src_dir.txt
+├── ui
+│   ├── app.rs
+│   ├── mod.rs
+│   ├── renderer.rs
+│   └── view_state.rs
+└── worker.rs
+
+8 directories, 21 files
