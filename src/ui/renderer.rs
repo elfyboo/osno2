@@ -84,7 +84,7 @@ impl AppLayout {
     pub fn render(&self, frame: &mut Frame, app: &mut App, vt_screen: &tui_term::vt100::Screen) {
         self.render_header(frame, app);
         self.render_main_view(frame, app);
-        self.render_snackbar(frame, app);
+        self.render_audio_player(frame, app);
         self.render_shell(frame, vt_screen); // UPDATE: Routed to terminal widget execution layer
     }
 
@@ -322,8 +322,10 @@ impl AppLayout {
         );
     }
 
-    fn render_snackbar(&self, frame: &mut Frame, app: &App) {
+    fn render_audio_player(&self, frame: &mut Frame, app: &App) {
         let block = Block::bordered()
+            .title(" Player ")
+            .title_style(Style::default().fg(FG_BRIGHT).bold())
             .border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_BLACK));
 
@@ -336,12 +338,18 @@ impl AppLayout {
 
         // 1-cell gap between thumbnail and the right column
         let right_block = Block::default().padding(Padding::left(1));
+        let left_block = Block::default().padding(Padding::left(1));
+
         let right_area = right_block.inner(inner_cols[1]);
+        let left_area = left_block.inner(inner_cols[0]);
+
+        let inner_left =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(left_area);
 
         let inner_right =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(right_area);
 
-        self.render_thumbnail(frame, inner_cols[0]);
+        self.render_thumbnail(frame, inner_left[0]);
         self.render_progress(frame, app, inner_right[0]);
         self.render_metadata(frame, app, inner_right[1]);
     }
@@ -349,8 +357,10 @@ impl AppLayout {
     /// Square slot showing either the spectrum visualizer or album art thumbnail.
     /// Currently always renders the visualizer placeholder; swap on `app` state
     /// once album art loading lands.
+
     fn render_thumbnail(&self, frame: &mut Frame, area: Rect) {
         let dots = render_dot_grid(area, &[]);
+
         frame.render_widget(
             Paragraph::new(dots).style(Style::default().bg(BG_BLACK)),
             area,
@@ -487,7 +497,6 @@ fn render_dot_grid(area: Rect, buckets: &[f32]) -> Vec<Line<'static>> {
         })
         .collect()
 }
-
 fn meta_line(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!(" {key}: "), Style::default().fg(FG_DIM)),
