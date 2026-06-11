@@ -1,0 +1,3118 @@
+// audio/audio_engine.rs
+
+use std::time::Duration;
+
+/// Commands sent from the model layer to the audio worker thread.
+/// The worker owns the cpal stream and symphonia decoder; this enum
+/// is the only channel through which playback state is mutated.
+#[derive(Clone, Debug)]
+pub enum AudioCommand {
+    Play,
+    Pause,
+    Stop,
+    Seek(Duration),
+    SetVolume(f32),
+    LoadTrack(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackStatus {
+    Playing,
+    Paused,
+    Stopped,
+}
+use std::time::Duration;
+
+use crossbeam_channel::Sender;
+
+pub use crate::audio::audio_engine::{AudioCommand, PlaybackStatus};
+
+/// Model-side view of audio playback state. Mutated by the reducer in
+/// response to AudioEvents; the actual decode/output runs on a worker
+/// thread (see `worker.rs` / `audio/mod.rs`) driven via `commands`.
+pub struct AudioState {
+    commands: Sender<AudioCommand>,
+    pub status: PlaybackStatus,
+    pub current_track: Option<String>,
+    pub position: Duration,
+    pub duration: Option<Duration>,
+    pub volume: f32,
+}
+
+impl AudioState {
+    pub fn new(commands: Sender<AudioCommand>) -> Self {
+        Self {
+            commands,
+            status: PlaybackStatus::Stopped,
+            current_track: None,
+            position: Duration::ZERO,
+            duration: None,
+            volume: 1.0,
+        }
+    }
+
+    pub fn play(&mut self) {
+        if self.current_track.is_none() {
+            return;
+        }
+        self.status = PlaybackStatus::Playing;
+        let _ = self.commands.send(AudioCommand::Play);
+    }
+
+    pub fn pause(&mut self) {
+        if self.status != PlaybackStatus::Playing {
+            return;
+        }
+        self.status = PlaybackStatus::Paused;
+        let _ = self.commands.send(AudioCommand::Pause);
+    }
+
+    pub fn stop(&mut self) {
+        self.status = PlaybackStatus::Stopped;
+        self.position = Duration::ZERO;
+        let _ = self.commands.send(AudioCommand::Stop);
+    }
+
+    pub fn seek(&mut self, position_ms: u64) {
+        let position = Duration::from_millis(position_ms);
+        self.position = position;
+        let _ = self.commands.send(AudioCommand::Seek(position));
+    }
+
+    pub fn set_volume(&mut self, level: f32) {
+        self.volume = level.clamp(0.0, 1.0);
+        let _ = self.commands.send(AudioCommand::SetVolume(self.volume));
+    }
+
+    pub fn load_track(&mut self, track_id: &str) {
+        self.current_track = Some(track_id.to_string());
+        self.position = Duration::ZERO;
+        self.duration = None;
+        self.status = PlaybackStatus::Stopped;
+        let _ = self
+            .commands
+            .send(AudioCommand::LoadTrack(track_id.to_string()));
+    }
+
+    /// Called by the controller when the worker reports updated
+    /// position/duration/status (separate from AppEvent dispatch,
+    /// since this is high-frequency and shouldn't go through the bus).
+    pub fn sync_from_engine(
+        &mut self,
+        position: Duration,
+        duration: Option<Duration>,
+        status: PlaybackStatus,
+    ) {
+        self.position = position;
+        self.duration = duration;
+        self.status = status;
+    }
+}
+pub mod audio_engine;
+pub mod audio_state;
+pub mod paths;
+use directories::{ProjectDirs, UserDirs};
+use std::path::PathBuf;
+
+pub struct AppPaths {
+    pub config_dir: PathBuf,
+    pub _library_dir: PathBuf,
+    pub _playlists_dir: PathBuf,
+    pub _music_root: PathBuf,
+}
+
+impl AppPaths {
+    pub fn resolve() -> Self {
+        let config_dir = Self::resolve_config_dir();
+        let _library_dir = config_dir.join("library");
+        let _playlists_dir = config_dir.join("playlists");
+        let _music_root = Self::resolve_music_root();
+
+        std::fs::create_dir_all(&config_dir).expect("Failed to create config directory");
+        std::fs::create_dir_all(&_library_dir).expect("Failed to create library directory");
+        std::fs::create_dir_all(&_playlists_dir).expect("Failed to create playlists directory");
+
+        Self {
+            config_dir,
+            _library_dir,
+            _playlists_dir,
+            _music_root,
+        }
+    }
+
+    fn resolve_config_dir() -> PathBuf {
+        if cfg!(debug_assertions) {
+            // Sandboxed inside the repo during development
+            std::env::current_dir()
+                .expect("Failed to resolve working directory")
+                .join("dev_env")
+                .join("config")
+        } else {
+            // Production: platform-correct config directory
+            // Windows: %APPDATA%\osno2
+            // macOS:   ~/Library/Application Support/osno2
+            // Linux:   ~/.config/osno2
+            ProjectDirs::from("", "", "osno2")
+                .expect("Failed to resolve platform config directory")
+                .config_dir()
+                .to_path_buf()
+        }
+    }
+
+    fn resolve_music_root() -> PathBuf {
+        UserDirs::new()
+            .and_then(|dirs| dirs.audio_dir().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    pub fn wezterm_config(&self) -> PathBuf {
+        self.config_dir.join("wezterm.lua")
+    }
+
+    pub fn _app_config(&self) -> PathBuf {
+        self.config_dir.join("config.toml")
+    }
+
+    pub fn _index_db(&self) -> PathBuf {
+        self._library_dir.join("index.db")
+    }
+
+    pub fn _tracks_toml(&self) -> PathBuf {
+        self._library_dir.join("tracks.toml")
+    }
+
+    pub fn _music_root(&self) -> &PathBuf {
+        &self._music_root
+    }
+}
+use crossterm::event::{KeyEvent, MouseEvent};
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum EventKind {
+    Input,
+    Library,
+    Audio,
+    Scrollback,
+}
+
+#[derive(Clone, Debug)]
+pub enum AppEvent {
+    Input(InputEvent),
+    Library(LibraryEvent),
+    Audio(AudioEvent),
+    Scrollback(ScrollbackEvent),
+}
+
+impl From<&AppEvent> for EventKind {
+    fn from(event: &AppEvent) -> Self {
+        match event {
+            AppEvent::Input(_) => EventKind::Input,
+            AppEvent::Library(_) => EventKind::Library,
+            AppEvent::Audio(_) => EventKind::Audio,
+            AppEvent::Scrollback(_) => EventKind::Scrollback,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum InputEvent {
+    KeyPress(KeyEvent),
+    Resize(u16, u16),
+    Mouse(MouseEvent),
+    Paste(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum LibraryEvent {
+    TrackAdded(String),
+    TrackRemoved(String),
+    TrackUpdated(String),
+    PlaylistCreated(String),
+    PlaylistUpdated(String),
+    PlaylistDeleted(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum AudioEvent {
+    Play,
+    Pause,
+    Stop,
+    Seek(u64),
+    Volume(f32),
+    TrackChanged(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum ScrollbackEvent {
+    AddLine(String),
+    Clear,
+    ScrollUp(u16),
+    ScrollDown(u16),
+}
+// controller/event_bus.rs
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use std::collections::{HashMap, HashSet};
+
+use crate::core::controller::events::{AppEvent, EventKind};
+use crate::core::model::reducer::reduce;
+use crate::core::model::state::AppState;
+
+pub type WidgetId = u32;
+
+/// Synchronous, ordered event dispatcher. Owns the receiving end of
+/// the input/event channel; not Clone — share via reference or Arc.
+pub struct EventBus {
+    tx: Sender<AppEvent>,
+    rx: Receiver<AppEvent>,
+    subscribers: HashMap<EventKind, HashSet<WidgetId>>,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        let (tx, rx) = unbounded();
+        Self {
+            tx,
+            rx,
+            subscribers: HashMap::new(),
+        }
+    }
+
+    /// Clone of the sender for handing to the input task or other producers.
+    pub fn sender(&self) -> Sender<AppEvent> {
+        self.tx.clone()
+    }
+
+    pub fn publish(&self, event: AppEvent) {
+        let _ = self.tx.send(event);
+    }
+
+    pub fn subscribe(&mut self, kind: EventKind, widget: WidgetId) {
+        self.subscribers.entry(kind).or_default().insert(widget);
+    }
+
+    pub fn unsubscribe(&mut self, kind: EventKind, widget: WidgetId) {
+        if let Some(subs) = self.subscribers.get_mut(&kind) {
+            subs.remove(&widget);
+        }
+    }
+
+    /// Drains and applies all pending events to `state` in order,
+    /// returning the set of widgets whose subscribed event kinds fired
+    /// this tick (for selective redraw).
+    pub fn process(&self, state: &mut AppState) -> HashSet<WidgetId> {
+        let mut dirty = HashSet::new();
+
+        while let Ok(event) = self.rx.try_recv() {
+            let kind = EventKind::from(&event);
+            reduce(&event, state);
+
+            if let Some(subs) = self.subscribers.get(&kind) {
+                dirty.extend(subs.iter().copied());
+            }
+        }
+
+        dirty
+    }
+}
+use crossbeam_channel::Sender;
+use crossterm::event::{Event as CtEvent, EventStream, KeyEventKind};
+use futures_util::StreamExt;
+
+use crate::core::controller::events::{AppEvent, InputEvent};
+
+pub async fn poll_loop(tx: Sender<AppEvent>) {
+    let mut stream = EventStream::new();
+
+    while let Some(result) = stream.next().await {
+        let ct_event = match result {
+            Ok(event) => event,
+            Err(_) => break,
+        };
+
+        let Some(input_event) = translate(ct_event) else {
+            continue;
+        };
+
+        if tx.send(AppEvent::Input(input_event)).is_err() {
+            break;
+        }
+    }
+}
+
+fn translate(event: CtEvent) -> Option<InputEvent> {
+    match event {
+        CtEvent::Key(key) if key.kind == KeyEventKind::Press => Some(InputEvent::KeyPress(key)),
+        CtEvent::Resize(w, h) => Some(InputEvent::Resize(w, h)),
+        CtEvent::Mouse(mouse) => Some(InputEvent::Mouse(mouse)),
+        CtEvent::Paste(text) => Some(InputEvent::Paste(text)),
+        _ => None,
+    }
+}
+// controller/mod.rs
+pub mod event_bus;
+pub mod events;
+pub mod input;
+
+//use crossbeam_channel::Sender;
+use tokio::task::JoinHandle;
+
+use crate::core::controller::event_bus::EventBus;
+//use crate::core::controller::events::AppEvent;
+
+pub struct Controller {
+    pub bus: EventBus,
+    input_task: JoinHandle<()>,
+}
+
+impl Controller {
+    pub fn spawn() -> Self {
+        let bus = EventBus::new();
+        let input_task = tokio::spawn(input::poll_loop(bus.sender()));
+        Self { bus, input_task }
+    }
+
+    pub fn stop(self) {
+        self.input_task.abort();
+    }
+}
+pub mod controller;
+pub mod model;
+pub mod view;
+use crate::core::model::library_track::LibraryTrackType;
+use symphonia::core::codecs::CodecId;
+
+pub struct CodecInformation {
+    pub codec_id: CodecId,
+    pub track_type: LibraryTrackType,
+    pub str_codec_id: &'static str,
+    pub str_track_type: &'static str,
+}
+use crate::core::model::library_track::LibraryTrack;
+use std::path::PathBuf;
+
+#[derive(Debug, thiserror::Error)]
+pub enum LibraryError {
+    #[error("track not found: {0}")]
+    TrackNotFound(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Abstraction over where library data comes from. Production uses
+/// `FsLibrary` (real filesystem scan); dev/test uses `SpoofedLibrary`
+/// (fixture data, no I/O).
+pub trait LibraryBackend: Send + Sync {
+    fn list_tracks(&self) -> Result<Vec<LibraryTrack>, LibraryError>;
+    fn get_meta(&self, id: &str) -> Result<LibraryTrack, LibraryError>;
+}
+
+pub struct FsLibrary {
+    root: PathBuf,
+}
+
+impl FsLibrary {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl LibraryBackend for FsLibrary {
+    fn list_tracks(&self) -> Result<Vec<LibraryTrack>, LibraryError> {
+        // Delegate to existing fs/ scanning (jwalk-based, per Cargo.toml)
+        // and library/library_track.rs for metadata extraction.
+        // Stub left for integration with existing fs::fs_entry module.
+        let _ = &self.root;
+        Ok(Vec::new())
+    }
+
+    fn get_meta(&self, id: &str) -> Result<LibraryTrack, LibraryError> {
+        Err(LibraryError::TrackNotFound(id.to_string()))
+    }
+}
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryPlaylist {
+    pub name: String,
+    pub track_ids: Vec<String>,
+}
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryTrack {
+    pub id: String, // sha256 of canonical path
+    pub path: PathBuf,
+    pub name: String,
+    pub artist: String,
+    pub album: String,
+    pub year: Option<u16>,
+    pub duration_secs: u64,
+    pub size_bytes: u64,
+    pub ext: String,
+    pub bitrate: Option<u32>,
+    pub sample_rate: Option<u32>,
+    pub codec: Option<String>,
+    pub rating: u8,    // 0-5
+    pub added_at: u64, // unix timestamp
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum LibraryTrackType {
+    Audio,
+    Video,
+    Subtitle,
+}
+pub mod codec_information;
+pub mod library;
+pub mod library_playlist;
+pub mod library_track;
+pub mod reducer;
+pub mod scrollback;
+pub mod state;
+pub mod store;
+pub mod view_state;
+// model/reducer.rs
+
+use crate::core::controller::events::{
+    AppEvent, AudioEvent, InputEvent, LibraryEvent, ScrollbackEvent,
+};
+use crate::core::model::state::AppState;
+use crate::core::model::view_state::AppAction;
+
+/// Single point of state mutation. Audio commands are dispatched to
+/// the worker thread via a non-blocking channel send as part of the
+/// audio reducer; library/scrollback/input reduction is pure
+/// in-memory state mutation with no I/O.
+pub fn reduce(event: &AppEvent, state: &mut AppState) -> Option<AppAction> {
+    match event {
+        AppEvent::Input(e) => reduce_input(e, state),
+        AppEvent::Library(e) => {
+            reduce_library(e, state);
+            None
+        }
+        AppEvent::Audio(e) => {
+            reduce_audio(e, state);
+            None
+        }
+        AppEvent::Scrollback(e) => {
+            reduce_scrollback(e, state);
+            None
+        }
+    }
+}
+
+fn reduce_input(event: &InputEvent, state: &mut AppState) -> Option<AppAction> {
+    match event {
+        InputEvent::KeyPress(key) => {
+            let track_count = state.tracks.len();
+            let fs_entry_count = state.fs_entries.len();
+            let action = state
+                .view_state
+                .handle_key(*key, track_count, fs_entry_count);
+
+            match action {
+                AppAction::Activate => Some(state.resolve_activation()),
+                other => Some(other),
+            }
+        }
+        InputEvent::Resize(w, h) => {
+            state.view_state.resize(*w, *h);
+            None
+        }
+        InputEvent::Mouse(_) | InputEvent::Paste(_) => None,
+    }
+}
+
+fn reduce_library(event: &LibraryEvent, state: &mut AppState) {
+    match event {
+        LibraryEvent::TrackAdded(id) => state.library_cache.invalidate(id),
+        LibraryEvent::TrackRemoved(id) => state.library_cache.remove(id),
+        LibraryEvent::TrackUpdated(id) => state.library_cache.invalidate(id),
+        LibraryEvent::PlaylistCreated(id)
+        | LibraryEvent::PlaylistUpdated(id)
+        | LibraryEvent::PlaylistDeleted(id) => state.library_cache.invalidate_playlist(id),
+    }
+}
+
+fn reduce_audio(event: &AudioEvent, state: &mut AppState) {
+    match event {
+        AudioEvent::Play => state.audio.play(),
+        AudioEvent::Pause => state.audio.pause(),
+        AudioEvent::Stop => state.audio.stop(),
+        AudioEvent::Seek(pos_ms) => state.audio.seek(*pos_ms),
+        AudioEvent::Volume(level) => state.audio.set_volume(*level),
+        AudioEvent::TrackChanged(id) => state.audio.load_track(id),
+    }
+}
+
+fn reduce_scrollback(event: &ScrollbackEvent, state: &mut AppState) {
+    match event {
+        ScrollbackEvent::AddLine(line) => state.scrollback.push_line(line.clone()),
+        ScrollbackEvent::Clear => state.scrollback.clear(),
+        ScrollbackEvent::ScrollUp(n) => state.scrollback.scroll_up(*n),
+        ScrollbackEvent::ScrollDown(n) => state.scrollback.scroll_down(*n),
+    }
+}
+// model/scrollback.rs
+
+use std::collections::VecDeque;
+
+/// Fixed-capacity ring buffer for terminal scrollback. Oldest lines
+/// are dropped once `capacity` is exceeded.
+pub struct ScrollbackBuffer {
+    lines: VecDeque<String>,
+    capacity: usize,
+    /// Offset from the bottom (0 = pinned to latest output).
+    scroll_offset: usize,
+}
+
+impl ScrollbackBuffer {
+    pub const DEFAULT_CAPACITY: usize = 10_000;
+
+    pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            lines: VecDeque::with_capacity(capacity.min(1024)),
+            capacity,
+            scroll_offset: 0,
+        }
+    }
+
+    pub fn push_line(&mut self, line: String) {
+        if self.lines.len() == self.capacity {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+
+        // New output resets the view to the bottom unless the user
+        // has scrolled back, in which case preserve their position
+        // relative to the new tail.
+        if self.scroll_offset > 0 {
+            self.scroll_offset = (self.scroll_offset + 1).min(self.lines.len().saturating_sub(1));
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_up(&mut self, n: u16) {
+        let max_offset = self.lines.len().saturating_sub(1);
+        self.scroll_offset = (self.scroll_offset + n as usize).min(max_offset);
+    }
+
+    pub fn scroll_down(&mut self, n: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n as usize);
+    }
+
+    /// Returns up to `viewport_height` lines visible at the current
+    /// scroll position, oldest first.
+    pub fn visible_iter(&self, viewport_height: usize) -> impl Iterator<Item = &String> {
+        let total = self.lines.len();
+        let end = total.saturating_sub(self.scroll_offset);
+        let start = end.saturating_sub(viewport_height);
+        self.lines
+            .iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+}
+
+impl Default for ScrollbackBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+// model/state.rs
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use crossbeam_channel::Receiver;
+
+use crate::audio::audio_state::AudioState;
+use crate::core::model::library::LibraryBackend;
+use crate::core::model::library_track::LibraryTrack;
+use crate::core::model::scrollback::ScrollbackBuffer;
+use crate::core::model::store::Store;
+use crate::core::model::view_state::{ActiveView, ViewState};
+use crate::fs::fs_entry::FsEntry;
+
+pub struct AppState {
+    pub scrollback: ScrollbackBuffer,
+    pub library: Box<dyn LibraryBackend>,
+    pub library_cache: LibraryCache,
+    pub store: Store,
+    pub audio: AudioState,
+    pub view_state: ViewState,
+
+    // Library/playback data (was on App in ui/app.rs)
+    pub now_playing: String,
+    pub playing_track: usize,
+    pub tracks: Vec<LibraryTrack>,
+    pub track_receiver: Option<Receiver<Vec<LibraryTrack>>>,
+
+    // Filesystem browser data
+    pub working_dir: PathBuf,
+    pub fs_entries: Vec<FsEntry>,
+
+    // Shell/REPL output history (scrollback is for the pty terminal;
+    // this is the sandboxed app's own command/response log)
+    pub shell_history: Vec<String>,
+}
+
+impl AppState {
+    pub fn new(library: Box<dyn LibraryBackend>, store: Store, audio: AudioState) -> Self {
+        Self {
+            scrollback: ScrollbackBuffer::new(),
+            library,
+            library_cache: LibraryCache::default(),
+            store,
+            audio,
+            view_state: ViewState::new(),
+            now_playing: "[No Track Playing]".into(),
+            playing_track: 0,
+            tracks: Vec::new(),
+            track_receiver: None,
+            working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            fs_entries: Vec::new(),
+            shell_history: vec!["System operational. Type commands below.".into()],
+        }
+    }
+
+    /// Drains the background library scanner channel for new tracks.
+    /// Call once per tick before rendering.
+    pub fn poll_scanner(&mut self) {
+        if let Some(rx) = &self.track_receiver {
+            let mut new_data = false;
+            while let Ok(mut new_tracks) = rx.try_recv() {
+                self.tracks.append(&mut new_tracks);
+                new_data = true;
+            }
+
+            if new_data {
+                self.tracks.sort_by(|a, b| {
+                    a.artist
+                        .cmp(&b.artist)
+                        .then(a.album.cmp(&b.album))
+                        .then(a.name.cmp(&b.name))
+                });
+            }
+        }
+    }
+
+    pub fn start_library_scan(&mut self, directory: PathBuf) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.track_receiver = Some(rx);
+        self.tracks.clear();
+        crate::library::scanner::spawn_library_scan(directory, tx);
+    }
+
+    /// Resolves AppAction::Activate from ViewState into a concrete
+    /// command/state update, since ViewState lacks access to tracks
+    /// and fs_entries.
+    pub fn resolve_activation(&mut self) -> crate::core::model::view_state::AppAction {
+        use crate::core::model::view_state::AppAction;
+        use crate::fs::fs_entry::FsEntryKind;
+
+        match self.view_state.active_view {
+            ActiveView::Tracklist => {
+                if self.tracks.is_empty() {
+                    return AppAction::None;
+                }
+                let track = &self.tracks[self.view_state.selected_track];
+                self.playing_track = self.view_state.selected_track;
+                self.now_playing = format!("{} - {}", track.artist, track.name);
+                AppAction::ExecuteCommand(format!("play {}", track.id))
+            }
+            ActiveView::Filesystem => {
+                if self.fs_entries.is_empty() {
+                    return AppAction::None;
+                }
+                let entry = &self.fs_entries[self.view_state.fs_selected];
+                match entry.kind {
+                    FsEntryKind::Directory => {
+                        AppAction::ExecuteCommand(format!("cd {}", entry.path.display()))
+                    }
+                    FsEntryKind::AudioFile => {
+                        AppAction::ExecuteCommand(format!("play {}", entry.path.display()))
+                    }
+                    FsEntryKind::File => AppAction::None,
+                }
+            }
+            _ => AppAction::None,
+        }
+    }
+
+    pub fn position_str(&self) -> String {
+        format_secs(self.audio.position.as_secs())
+    }
+
+    pub fn duration_str(&self) -> String {
+        format_secs(self.audio.duration.map(|d| d.as_secs()).unwrap_or(0))
+    }
+}
+
+fn format_secs(secs: u64) -> String {
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+#[derive(Default)]
+pub struct LibraryCache {
+    stale_tracks: HashSet<String>,
+    stale_playlists: HashSet<String>,
+}
+
+impl LibraryCache {
+    pub fn invalidate(&mut self, track_id: &str) {
+        self.stale_tracks.insert(track_id.to_string());
+    }
+
+    pub fn remove(&mut self, track_id: &str) {
+        self.stale_tracks.remove(track_id);
+    }
+
+    pub fn invalidate_playlist(&mut self, playlist_id: &str) {
+        self.stale_playlists.insert(playlist_id.to_string());
+    }
+
+    pub fn is_track_stale(&self, track_id: &str) -> bool {
+        self.stale_tracks.contains(track_id)
+    }
+
+    pub fn is_playlist_stale(&self, playlist_id: &str) -> bool {
+        self.stale_playlists.contains(playlist_id)
+    }
+}
+use std::path::Path;
+
+use redb::{Database, ReadableDatabase, TableDefinition};
+use serde::{Serialize, de::DeserializeOwned};
+
+const PLAYLISTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("playlists");
+const TRACK_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("track_meta");
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("database error: {0}")]
+    Database(#[from] redb::DatabaseError),
+    #[error("transaction error: {0}")]
+    Transaction(#[from] redb::TransactionError),
+    #[error("table error: {0}")]
+    Table(#[from] redb::TableError),
+    #[error("storage error: {0}")]
+    Storage(#[from] redb::StorageError),
+    #[error("commit error: {0}")]
+    Commit(#[from] redb::CommitError),
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("not found: {0}")]
+    NotFound(String),
+}
+
+/// Thin wrapper around redb. Callers work with typed values; this
+/// module owns the encoding (JSON) and table layout.
+pub struct Store {
+    db: Database,
+}
+
+impl Store {
+    pub fn open(path: &Path) -> Result<Self, StoreError> {
+        let db = Database::create(path)?;
+
+        let txn = db.begin_write()?;
+        {
+            txn.open_table(PLAYLISTS_TABLE)?;
+            txn.open_table(TRACK_META_TABLE)?;
+        }
+        txn.commit()?;
+
+        Ok(Self { db })
+    }
+
+    pub fn get_playlist<T: DeserializeOwned>(&self, id: &str) -> Result<T, StoreError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PLAYLISTS_TABLE)?;
+        let bytes = table
+            .get(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        Ok(serde_json::from_slice(bytes.value())?)
+    }
+
+    pub fn save_playlist<T: Serialize>(&self, id: &str, value: &T) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(value)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(PLAYLISTS_TABLE)?;
+            table.insert(id, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_playlist(&self, id: &str) -> Result<(), StoreError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(PLAYLISTS_TABLE)?;
+            table.remove(id)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_track_meta<T: DeserializeOwned>(&self, id: &str) -> Result<T, StoreError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(TRACK_META_TABLE)?;
+        let bytes = table
+            .get(id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        Ok(serde_json::from_slice(bytes.value())?)
+    }
+
+    pub fn save_track_meta<T: Serialize>(&self, id: &str, value: &T) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(value)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(TRACK_META_TABLE)?;
+            table.insert(id, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+}
+// model/view_state.rs
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tui_slider::SliderState;
+
+//use crate::core::model::library_track::LibraryTrack;
+
+#[derive(Default, PartialEq, Debug, Clone, Copy)]
+pub enum ActiveView {
+    #[default]
+    Tracklist,
+    Filesystem,
+    Visualizer,
+    Settings,
+    Help,
+}
+
+/// Actions the view loop delegates up to the controller/worker.
+#[derive(Debug, Clone)]
+pub enum AppAction {
+    ExecuteCommand(String),
+    ToggleTerminalFocus,
+    Activate,
+    None,
+}
+
+/// Pure navigation/selection/input state. Contains no playback,
+/// library, or filesystem data — those live in AppState's other
+/// fields and are read directly by the renderer.
+pub struct ViewState {
+    pub active_view: ActiveView,
+    pub selected_track: usize,
+    pub fs_selected: usize,
+    pub volume_state: SliderState,
+    pub shell_input: String,
+    pub terminal_width: u16,
+    pub terminal_height: u16,
+}
+
+impl ViewState {
+    pub fn new() -> Self {
+        Self {
+            active_view: ActiveView::default(),
+            selected_track: 0,
+            fs_selected: 0,
+            volume_state: SliderState::new(50.0, 0.0, 100.0),
+            shell_input: String::new(),
+            terminal_width: 0,
+            terminal_height: 0,
+        }
+    }
+
+    pub fn resize(&mut self, width: u16, height: u16) {
+        self.terminal_width = width;
+        self.terminal_height = height;
+    }
+
+    /// Processes keyboard input. `track_count` and `fs_entry_count`
+    /// are passed in by the reducer (read from AppState's library/fs
+    /// fields) since ViewState doesn't own that data.
+    pub fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        track_count: usize,
+        fs_entry_count: usize,
+    ) -> AppAction {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('1') => self.active_view = ActiveView::Tracklist,
+                KeyCode::Char('2') => self.active_view = ActiveView::Filesystem,
+                KeyCode::Char('3') => self.active_view = ActiveView::Visualizer,
+                KeyCode::Char('4') => self.active_view = ActiveView::Settings,
+                KeyCode::Char('5') => self.active_view = ActiveView::Help,
+                _ => {}
+            }
+            return AppAction::None;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+        {
+            return AppAction::ToggleTerminalFocus;
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.handle_up(fs_entry_count);
+                AppAction::None
+            }
+            KeyCode::Down => {
+                self.handle_down(track_count, fs_entry_count);
+                AppAction::None
+            }
+            KeyCode::Tab => {
+                self.cycle_view();
+                AppAction::None
+            }
+            KeyCode::Enter => self.handle_enter(),
+            _ => {
+                self.handle_shell_input(key);
+                AppAction::None
+            }
+        }
+    }
+
+    fn handle_up(&mut self, _fs_entry_count: usize) {
+        match self.active_view {
+            ActiveView::Tracklist => self.selected_track = self.selected_track.saturating_sub(1),
+            ActiveView::Filesystem => self.fs_selected = self.fs_selected.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    fn handle_down(&mut self, track_count: usize, fs_entry_count: usize) {
+        match self.active_view {
+            ActiveView::Tracklist => {
+                if self.selected_track + 1 < track_count {
+                    self.selected_track += 1;
+                }
+            }
+            ActiveView::Filesystem => {
+                if self.fs_selected + 1 < fs_entry_count {
+                    self.fs_selected += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cycle_view(&mut self) {
+        self.active_view = match self.active_view {
+            ActiveView::Tracklist => ActiveView::Filesystem,
+            ActiveView::Filesystem => ActiveView::Visualizer,
+            ActiveView::Visualizer => ActiveView::Settings,
+            ActiveView::Settings => ActiveView::Help,
+            ActiveView::Help => ActiveView::Tracklist,
+        };
+    }
+
+    /// Tracklist/filesystem Enter actions need data ViewState doesn't
+    /// own (track id, fs entry path/kind) — those branches return a
+    /// marker AppAction that the controller resolves against
+    /// AppState before dispatching. See AppAction::Activate.
+    fn handle_enter(&mut self) -> AppAction {
+        match self.active_view {
+            ActiveView::Tracklist | ActiveView::Filesystem => AppAction::Activate,
+            _ => {
+                let input = self.shell_input.trim().to_string();
+                if !input.is_empty() {
+                    self.shell_input.clear();
+                    AppAction::ExecuteCommand(input)
+                } else {
+                    AppAction::None
+                }
+            }
+        }
+    }
+
+    fn handle_shell_input(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Backspace => {
+                self.shell_input.pop();
+            }
+            KeyCode::Char(c) => {
+                self.shell_input.push(c);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Debug, Clone)]
+pub struct Frontend {
+    pub state: String,
+}
+pub mod frontend;
+use std::path::PathBuf;
+
+pub struct FsEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub ext: String,
+    pub size_bytes: u64,
+    pub is_dir: bool,
+    pub kind: FsEntryKind,
+}
+
+pub enum FsEntryKind {
+    Directory,
+    AudioFile,
+    File,
+}
+pub mod fs_entry;
+use std::env;
+use std::process::{Command, Stdio};
+
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let current_exe = env::current_exe()?;
+    let paths = crate::config::paths::AppPaths::resolve();
+    seed_wezterm_config(&paths.wezterm_config())?;
+    match which::which("wezterm") {
+        Ok(wezterm_path) => spawn_wezterm(&wezterm_path, &current_exe),
+        Err(_) => {
+            eprintln!("⚠ WezTerm not found on PATH. Running in fallback terminal mode.");
+            eprintln!("  Install WezTerm: https://wezfurlong.org/wezterm/installation.html");
+            fallback_worker(&current_exe)
+        }
+    }
+}
+
+fn seed_wezterm_config(dest: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    if dest.exists() {
+        return Ok(());
+    }
+
+    // Embedded at compile time -- no external file dependency at runtime
+    let lua = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/wezterm.lua"));
+    std::fs::write(dest, lua)?;
+    Ok(())
+}
+
+fn spawn_wezterm(
+    wezterm_path: &std::path::Path,
+    current_exe: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = crate::config::paths::AppPaths::resolve()
+        .config_dir
+        .join("wezterm.lua");
+
+    Command::new(wezterm_path)
+        .arg("start")
+        .arg("--no-auto-connect")
+        .arg("--")
+        .arg(current_exe)
+        .arg("--worker")
+        .env("WEZTERM_CONFIG_FILE", &config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    Ok(())
+}
+
+fn fallback_worker(current_exe: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut child = Command::new(current_exe).arg("--worker").spawn()?;
+
+    child.wait()?;
+    Ok(())
+}
+use crate::worker::AppEvent;
+use std::collections::HashSet;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::core::model::library_playlist::LibraryPlaylist;
+use crate::core::model::library_track::LibraryTrack;
+use crate::fs::fs_entry::{FsEntry, FsEntryKind};
+
+use jwalk::WalkDir;
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia_core::formats::TrackType;
+use symphonia_core::formats::probe::Hint;
+use symphonia_core::meta::StandardTag;
+
+const TRACKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tracks");
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "wav", "m4a", "aac", "opus"];
+
+#[derive(Clone)]
+pub struct LibraryService {
+    db: Arc<redb::Database>,
+    meta_dir: PathBuf,
+    playlists_dir: PathBuf,
+}
+
+impl LibraryService {
+    pub fn new(db: redb::Database, meta_dir: PathBuf, playlists_dir: PathBuf) -> Self {
+        Self {
+            db: Arc::new(db),
+            meta_dir,
+            playlists_dir,
+        }
+    }
+
+    fn extract_track_metadata(&self, path: &Path) -> Result<LibraryTrack, std::io::Error> {
+        let clean_path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let file = File::open(&clean_path)?;
+        let size_bytes = file.metadata()?.len();
+
+        let ext = clean_path
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+
+        let name = clean_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+
+        // Generate SHA-256 ID out of the canonical path string
+        let id: String = "???".to_string();
+
+        // format!(
+        //     "{:x}",
+        //     sha2::Sha256::digest(clean_path.to_string_lossy().as_bytes())
+        // );
+
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension(&ext);
+
+        // 1. Initialize demuxer. (Mandatory step to read container headers)
+        let mut probe = symphonia::core::formats::probe::Probe::default();
+        symphonia::default::register_enabled_formats(&mut probe);
+
+        let mut format_reader = probe
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+        let mut duration_secs: u64 = 0;
+        let mut sample_rate: Option<u32> = None;
+        let mut bitrate: Option<u32> = None;
+        let mut codec_name: Option<String> = None;
+
+        // fetch audio track
+        if let Some(track) = format_reader.default_track(TrackType::Audio) {
+            if let Some(params) = track.codec_params.clone() {
+                if params.is_audio() {
+                    if let Some(audio_params) = params.audio() {
+                        sample_rate = audio_params.sample_rate;
+
+                        if let (Some(frames), Some(sample_rate)) =
+                            (track.num_frames, audio_params.sample_rate)
+                        {
+                            duration_secs = (frames as f64 / sample_rate as f64) as u64;
+                        } else {
+                            duration_secs = 0;
+                        }
+
+                        bitrate = audio_params.bits_per_sample.or_else(|| {
+                            if duration_secs > 0 {
+                                Some(((size_bytes * 8) / duration_secs) as u32)
+                            } else {
+                                None
+                            }
+                        });
+
+                        codec_name = Some(audio_params.codec.to_string());
+                    }
+                }
+            }
+        }
+
+        // 4. Extract Text Tags (Artist, Album, Title, Year)
+        let mut track_name = name.clone(); // Fallback to filename
+        let mut artist = "Unknown Artist".to_string();
+        let mut album = "Unknown Album".to_string();
+        let mut year: Option<u16> = None;
+
+        if let Some(metadata) = format_reader.metadata().current() {
+            for tag in metadata.clone().media.tags {
+                if let Some(std_key) = tag.clone().std {
+                    match std_key {
+                        StandardTag::TrackTitle(val) => track_name = val.to_string(),
+                        StandardTag::Artist(val) => artist = val.to_string(),
+                        StandardTag::Album(val) => album = val.to_string(),
+                        StandardTag::ReleaseYear(val) => year = Some(val),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let added_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Ok(LibraryTrack {
+            id,
+            path: clean_path,
+            name: track_name,
+            artist,
+            album,
+            year,
+            duration_secs,
+            size_bytes,
+            ext,
+            bitrate,
+            sample_rate,
+            codec: codec_name,
+            rating: 0,
+            added_at,
+        })
+    }
+
+    pub fn read_dir(&self, path: &Path) -> Result<Vec<FsEntry>, std::io::Error> {
+        let mut entries: Vec<FsEntry> = std::fs::read_dir(path)?
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                let is_dir = path.is_dir();
+                let size_bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+                let ext = path
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                let kind = if is_dir {
+                    FsEntryKind::Directory
+                } else {
+                    FsEntryKind::File
+                };
+                FsEntry {
+                    path,
+                    name,
+                    ext,
+                    size_bytes,
+                    is_dir,
+                    kind,
+                }
+            })
+            .collect();
+
+        // Dirs first, then files, both alphabetical
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+
+        Ok(entries)
+    }
+
+    pub fn all_tracks(&self) -> Result<Vec<LibraryTrack>, std::io::Error> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let table = match read_txn.open_table(TRACKS_TABLE) {
+            Ok(t) => t,
+            // Table doesn't exist yet -- library is empty
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut tracks = Vec::new();
+        for entry in table
+            .iter()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        {
+            let (_, value) =
+                entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let toml_str = std::str::from_utf8(value.value())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if let Ok(track) = toml::from_str::<LibraryTrack>(toml_str) {
+                tracks.push(track);
+            }
+        }
+
+        Ok(tracks)
+    }
+
+    pub fn search(&self, query: &str) -> Result<Vec<LibraryTrack>, std::io::Error> {
+        let q = query.to_lowercase();
+        let tracks = self.all_tracks()?;
+        Ok(tracks
+            .into_iter()
+            .filter(|t| {
+                t.name.to_lowercase().contains(&q)
+                    || t.artist.to_lowercase().contains(&q)
+                    || t.album.to_lowercase().contains(&q)
+            })
+            .collect())
+    }
+
+    pub fn add_track(&self, path: &Path) -> Result<LibraryTrack, std::io::Error> {
+        let track = self.extract_track_metadata(path)?;
+
+        let toml_string = toml::to_string(&track)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        {
+            let mut table = write_txn
+                .open_table(TRACKS_TABLE)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            table
+                .insert(track.id.as_str(), toml_string.as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        Ok(track)
+    }
+
+    pub fn remove_track(&self, id: &str) -> Result<(), std::io::Error> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        {
+            let mut table = write_txn
+                .open_table(TRACKS_TABLE)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            table
+                .remove(id)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
+    }
+
+    pub fn update_rating(&self, id: &str, rating: u8) -> Result<(), std::io::Error> {
+        let mut track = self
+            .all_tracks()?
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Track not found"))?;
+
+        track.rating = rating.min(5);
+
+        let toml_string = toml::to_string(&track)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        {
+            let mut table = write_txn
+                .open_table(TRACKS_TABLE)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            table
+                .insert(id, toml_string.as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
+    }
+
+    pub fn reindex(&self) -> Result<(), std::io::Error> {
+        // Walk meta_dir for any .toml track files and re-insert into redb
+        if !self.meta_dir.exists() {
+            return Ok(());
+        }
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        {
+            let mut table = write_txn
+                .open_table(TRACKS_TABLE)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+            for entry in std::fs::read_dir(&self.meta_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().unwrap_or_default() == "toml" {
+                    if let Ok(contents) = std::fs::read_to_string(&path) {
+                        if let Ok(track) = toml::from_str::<LibraryTrack>(&contents) {
+                            let _ = table.insert(track.id.as_str(), contents.as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
+    }
+
+    pub fn all_playlists(&self) -> Result<Vec<LibraryPlaylist>, std::io::Error> {
+        if !self.playlists_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut playlists = Vec::new();
+        for entry in std::fs::read_dir(&self.playlists_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().unwrap_or_default() == "toml" {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    if let Ok(playlist) = toml::from_str::<LibraryPlaylist>(&contents) {
+                        playlists.push(playlist);
+                    }
+                }
+            }
+        }
+        Ok(playlists)
+    }
+
+    pub fn playlist(&self, name: &str) -> Result<Option<Vec<LibraryTrack>>, std::io::Error> {
+        let safe_name = name.replace(|c: char| !c.is_alphanumeric(), "_");
+        let file_path = self.playlists_dir.join(format!("{}.toml", safe_name));
+
+        if !file_path.exists() {
+            return Ok(None);
+        }
+
+        let contents = std::fs::read_to_string(&file_path)?;
+        let playlist: LibraryPlaylist = toml::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let all = self.all_tracks()?;
+        let tracks = playlist
+            .track_ids
+            .iter()
+            .filter_map(|id| all.iter().find(|t| &t.id == id).cloned())
+            .collect();
+
+        Ok(Some(tracks))
+    }
+
+    pub fn create_playlist(&self, name: &str) -> Result<(), std::io::Error> {
+        let safe_name = name.replace(|c: char| !c.is_alphanumeric(), "_");
+        let file_path = self.playlists_dir.join(format!("{}.toml", safe_name));
+
+        if file_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Playlist already exists",
+            ));
+        }
+
+        std::fs::create_dir_all(&self.playlists_dir)?;
+
+        let playlist = LibraryPlaylist {
+            name: name.to_string(),
+            track_ids: Vec::new(),
+        };
+
+        let toml_str = toml::to_string(&playlist)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(file_path, toml_str)?;
+        Ok(())
+    }
+
+    pub fn add_to_playlist(
+        &self,
+        playlist_name: &str,
+        track_id: &str,
+    ) -> Result<(), std::io::Error> {
+        let safe_name = playlist_name.replace(|c: char| !c.is_alphanumeric(), "_");
+        let file_path = self.playlists_dir.join(format!("{}.toml", safe_name));
+
+        let contents = std::fs::read_to_string(&file_path)?;
+        let mut playlist: LibraryPlaylist = toml::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        if !playlist.track_ids.contains(&track_id.to_string()) {
+            playlist.track_ids.push(track_id.to_string());
+        }
+
+        let toml_str = toml::to_string(&playlist)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(file_path, toml_str)?;
+        Ok(())
+    }
+
+    pub fn remove_from_playlist(
+        &self,
+        playlist_name: &str,
+        track_id: &str,
+    ) -> Result<(), std::io::Error> {
+        let safe_name = playlist_name.replace(|c: char| !c.is_alphanumeric(), "_");
+        let file_path = self.playlists_dir.join(format!("{}.toml", safe_name));
+
+        let contents = std::fs::read_to_string(&file_path)?;
+        let mut playlist: LibraryPlaylist = toml::from_str(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        playlist.track_ids.retain(|id| id != track_id);
+
+        let toml_str = toml::to_string(&playlist)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(file_path, toml_str)?;
+        Ok(())
+    }
+
+    /// Walks `music_root` for audio files not yet indexed, extracts metadata for
+    /// each, persists it, and emits one `LibraryScanProgress` event per new track.
+    /// Sends `LibraryScanComplete` when the walk finishes.
+    pub async fn scan_library(self, music_root: PathBuf, tx: crossbeam_channel::Sender<AppEvent>) {
+        let known_paths: HashSet<PathBuf> = match self.all_tracks() {
+            Ok(tracks) => tracks.into_iter().map(|t| t.path).collect(),
+            Err(_) => HashSet::new(),
+        };
+
+        let candidates: Vec<PathBuf> = WalkDir::new(&music_root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path())
+            .filter(|p| {
+                let ext = p
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                AUDIO_EXTENSIONS.contains(&ext.as_str())
+            })
+            .filter(|p| {
+                let canonical = dunce::canonicalize(p).unwrap_or_else(|_| p.clone());
+                !known_paths.contains(&canonical)
+            })
+            .collect();
+
+        for path in candidates {
+            let svc = self.clone();
+            let tx = tx.clone();
+
+            let result = tokio::task::spawn_blocking(move || svc.add_track(&path)).await;
+
+            match result {
+                Ok(Err(_)) | Err(_) => {
+                    // Skip unreadable/corrupt files; don't abort the whole scan
+                }
+                Ok(Ok(track)) => {
+                    let _ = tx.send(AppEvent::LibraryScanProgress(track.duration_secs));
+                }
+            }
+        }
+
+        let _ = tx.send(AppEvent::LibraryScanComplete);
+    }
+}
+use symphonia::core::codecs::CodecId;
+use symphonia::core::codecs::audio::well_known as audio_codecs;
+use symphonia::core::codecs::subtitle::well_known as subtitle_codecs;
+use symphonia::core::codecs::video::well_known as video_codecs;
+
+use crate::core::model::codec_information::CodecInformation;
+use crate::core::model::library_track::LibraryTrackType;
+
+pub fn get_codec_info(codec_id: &CodecId) -> Option<CodecInformation> {
+    match codec_id {
+        CodecId::Audio(audio_id) => {
+            let name = match *audio_id {
+                audio_codecs::CODEC_ID_AAC => "aac",
+                audio_codecs::CODEC_ID_MP3 => "mp3",
+                audio_codecs::CODEC_ID_WMA => "wma",
+                audio_codecs::CODEC_ID_AC3 => "ac3",
+                audio_codecs::CODEC_ID_AC4 => "ac4",
+                audio_codecs::CODEC_ID_MP1 => "mp1",
+                audio_codecs::CODEC_ID_MP2 => "mp2",
+                audio_codecs::CODEC_ID_DCA => "dca",
+                audio_codecs::CODEC_ID_OPUS => "opus",
+                audio_codecs::CODEC_ID_ALAC => "alac",
+                audio_codecs::CODEC_ID_APTX => "aptx",
+                audio_codecs::CODEC_ID_RA10 => "ra10",
+                audio_codecs::CODEC_ID_RA20 => "ra20",
+                audio_codecs::CODEC_ID_RALF => "ralf",
+                audio_codecs::CODEC_ID_COOK => "cook",
+                audio_codecs::CODEC_ID_SIPR => "sipr",
+                audio_codecs::CODEC_ID_FLAC => "flac",
+                audio_codecs::CODEC_ID_LDAC => "ldac",
+                audio_codecs::CODEC_ID_SPEEX => "speex",
+                audio_codecs::CODEC_ID_ATRAC3 => "atrac3",
+                audio_codecs::CODEC_ID_ATRAC1 => "atrac1",
+                audio_codecs::CODEC_ID_APTX_HD => "aptx_hd",
+                audio_codecs::CODEC_ID_ATRAC9 => "atrac9",
+                audio_codecs::CODEC_ID_MONKEYS_AUDIO => "monkeys_audio",
+                audio_codecs::CODEC_ID_VORBIS => "vorbis",
+                audio_codecs::CODEC_ID_TRUEHD => "truehd",
+                audio_codecs::CODEC_ID_WAVPACK => "wavpack",
+                audio_codecs::CODEC_ID_ADPCM_MS => "adpcm_ms",
+                audio_codecs::CODEC_ID_PCM_ALAW => "pcm_alaw",
+                audio_codecs::CODEC_ID_MUSEPACK => "musepack",
+                audio_codecs::CODEC_ID_PCM_MULAW => "pcm_mulaw",
+                audio_codecs::CODEC_ID_ADPCM_G726 => "adpcm_g726",
+                audio_codecs::CODEC_ID_ADPCM_G722 => "adpcm_g722",
+                audio_codecs::CODEC_ID_BINK_AUDIO => "bink_audio",
+                audio_codecs::CODEC_ID_ADPCM_IMA_QT => "adpcm_ima_qt",
+                audio_codecs::CODEC_ID_ATRAC3PLUS => "atrac3plus",
+                audio_codecs::CODEC_ID_ADPCM_IMA_WAV => "adpcm_ima_wav",
+                audio_codecs::CODEC_ID_SMACKER_AUDIO => "smacker_audio",
+                audio_codecs::CODEC_ID_PCM_S8 => "pcm_s8",
+                audio_codecs::CODEC_ID_PCM_U8 => "pcm_u8",
+                audio_codecs::CODEC_ID_PCM_S8_PLANAR => "pcm_s8_planar",
+                audio_codecs::CODEC_ID_PCM_U8_PLANAR => "pcm_u8_planar",
+                audio_codecs::CODEC_ID_PCM_U32BE_PLANAR => "pcm_u32be_planar",
+                audio_codecs::CODEC_ID_PCM_S32BE_PLANAR => "pcm_s32be_planar",
+                audio_codecs::CODEC_ID_PCM_S16BE_PLANAR => "pcm_s16be_planar",
+                audio_codecs::CODEC_ID_PCM_S32LE_PLANAR => "pcm_s32le_planar",
+                audio_codecs::CODEC_ID_PCM_U32LE_PLANAR => "pcm_u32le_planar",
+                audio_codecs::CODEC_ID_PCM_S24BE_PLANAR => "pcm_s24be_planar",
+                audio_codecs::CODEC_ID_PCM_S24LE_PLANAR => "pcm_s24le_planar",
+                audio_codecs::CODEC_ID_PCM_F64LE_PLANAR => "pcm_f64le_planar",
+                audio_codecs::CODEC_ID_PCM_S16LE_PLANAR => "pcm_s16le_planar",
+                audio_codecs::CODEC_ID_PCM_U16BE_PLANAR => "pcm_u16be_planar",
+                audio_codecs::CODEC_ID_PCM_F64BE_PLANAR => "pcm_f64be_planar",
+                audio_codecs::CODEC_ID_PCM_U16LE_PLANAR => "pcm_u16le_planar",
+                audio_codecs::CODEC_ID_PCM_U24LE_PLANAR => "pcm_u24le_planar",
+                audio_codecs::CODEC_ID_PCM_U24BE_PLANAR => "pcm_u24be_planar",
+                audio_codecs::CODEC_ID_PCM_F32LE_PLANAR => "pcm_f32le_planar",
+                audio_codecs::CODEC_ID_PCM_F32BE_PLANAR => "pcm_f32be_planar",
+                audio_codecs::CODEC_ID_ADPCM_G726LE => "adpcm_g726le",
+                audio_codecs::CODEC_ID_PCM_S16LE => "pcm_s16le",
+                audio_codecs::CODEC_ID_PCM_U16LE => "pcm_u16le",
+                audio_codecs::CODEC_ID_PCM_S24LE => "pcm_s24le",
+                audio_codecs::CODEC_ID_PCM_S32LE => "pcm_s32le",
+                audio_codecs::CODEC_ID_PCM_U24BE => "pcm_u24be",
+                audio_codecs::CODEC_ID_PCM_U32BE => "pcm_u32be",
+                audio_codecs::CODEC_ID_PCM_U24LE => "pcm_u24le",
+                audio_codecs::CODEC_ID_PCM_S16BE => "pcm_s16be",
+                audio_codecs::CODEC_ID_PCM_U16BE => "pcm_u16be",
+                audio_codecs::CODEC_ID_PCM_S32BE => "pcm_s32be",
+                audio_codecs::CODEC_ID_PCM_S24BE => "pcm_s24be",
+                audio_codecs::CODEC_ID_PCM_F32BE => "pcm_f32be",
+                audio_codecs::CODEC_ID_PCM_F64BE => "pcm_f64be",
+                _ => return None,
+            };
+            Some(CodecInformation {
+                codec_id: *codec_id,
+                track_type: LibraryTrackType::Audio,
+                str_codec_id: name,
+                str_track_type: "audio",
+            })
+        }
+        CodecId::Video(video_id) => {
+            let name = match *video_id {
+                video_codecs::CODEC_ID_FLV => "flv",
+                video_codecs::CODEC_ID_H264 => "h264",
+                video_codecs::CODEC_ID_AV1 => "av1",
+                video_codecs::CODEC_ID_VVC => "vvc",
+                video_codecs::CODEC_ID_VC1 => "vc1",
+                video_codecs::CODEC_ID_VP3 => "vp3",
+                video_codecs::CODEC_ID_VP4 => "vp4",
+                video_codecs::CODEC_ID_VP5 => "vp5",
+                video_codecs::CODEC_ID_VP6 => "vp6",
+                video_codecs::CODEC_ID_VP7 => "vp7",
+                video_codecs::CODEC_ID_VP8 => "vp8",
+                video_codecs::CODEC_ID_VP9 => "vp9",
+                video_codecs::CODEC_ID_HEVC => "hevc",
+                video_codecs::CODEC_ID_AVS1 => "avs1",
+                video_codecs::CODEC_ID_AVS2 => "avs2",
+                video_codecs::CODEC_ID_AVS3 => "avs3",
+                video_codecs::CODEC_ID_WMV1 => "wmv1",
+                video_codecs::CODEC_ID_WMV2 => "wmv2",
+                video_codecs::CODEC_ID_WMV3 => "wmv3",
+                video_codecs::CODEC_ID_H261 => "h261",
+                video_codecs::CODEC_ID_H263 => "h263",
+                video_codecs::CODEC_ID_RV10 => "rv10",
+                video_codecs::CODEC_ID_RV20 => "rv20",
+                video_codecs::CODEC_ID_RV30 => "rv30",
+                video_codecs::CODEC_ID_RV40 => "rv40",
+                video_codecs::CODEC_ID_SVQ1 => "svq1",
+                video_codecs::CODEC_ID_SVQ3 => "svq3",
+                video_codecs::CODEC_ID_MJPEG => "mjpeg",
+                video_codecs::CODEC_ID_MPEG1 => "mpeg1",
+                video_codecs::CODEC_ID_MPEG2 => "mpeg2",
+                video_codecs::CODEC_ID_MPEG4 => "mpeg4",
+                video_codecs::CODEC_ID_INDEO5 => "indeo5",
+                video_codecs::CODEC_ID_INDEO3 => "indeo3",
+                video_codecs::CODEC_ID_INDEO2 => "indeo2",
+                video_codecs::CODEC_ID_INDEO4 => "indeo4",
+                video_codecs::CODEC_ID_SMACKER_VIDEO => "smacker_video",
+                video_codecs::CODEC_ID_CINEPAK => "cinepak",
+                video_codecs::CODEC_ID_THEORA => "theora",
+                video_codecs::CODEC_ID_BINK_VIDEO => "bink_video",
+                video_codecs::CODEC_ID_MSMPEG4V1 => "msmpeg4v1",
+                video_codecs::CODEC_ID_MSMPEG4V2 => "msmpeg4v2",
+                video_codecs::CODEC_ID_MSMPEG4V3 => "msmpeg4v3",
+                _ => return None,
+            };
+            Some(CodecInformation {
+                codec_id: *codec_id,
+                track_type: LibraryTrackType::Video,
+                str_codec_id: name,
+                str_track_type: "video",
+            })
+        }
+        CodecId::Subtitle(subtitle_id) => {
+            let name = match *subtitle_id {
+                subtitle_codecs::CODEC_ID_ASS => "ass",
+                subtitle_codecs::CODEC_ID_SRT => "srt",
+                subtitle_codecs::CODEC_ID_BMP => "bmp",
+                subtitle_codecs::CODEC_ID_SSA => "ssa",
+                subtitle_codecs::CODEC_ID_KATE => "kate",
+                subtitle_codecs::CODEC_ID_SAMI => "sami",
+                subtitle_codecs::CODEC_ID_WEBVTT => "webvtt",
+                subtitle_codecs::CODEC_ID_VOBSUB => "vobsub",
+                subtitle_codecs::CODEC_ID_DVBSUB => "dvbsub",
+                subtitle_codecs::CODEC_ID_HDMV_PGS => "hdmv_pgs",
+                subtitle_codecs::CODEC_ID_MOV_TEXT => "mov_text",
+                subtitle_codecs::CODEC_ID_HDMV_TEXTST => "hdmv_textst",
+                subtitle_codecs::CODEC_ID_TEXT_UTF8 => "text_utf8",
+                _ => return None,
+            };
+            Some(CodecInformation {
+                codec_id: *codec_id,
+                track_type: LibraryTrackType::Subtitle,
+                str_codec_id: name,
+                str_track_type: "subtitle",
+            })
+        }
+        _ => None,
+    }
+}
+pub mod library_service;
+pub mod library_utils;
+pub mod scanner;
+// library/scanner.rs
+
+use crate::core::model::library_track::LibraryTrack;
+use crossbeam_channel::Sender;
+use jwalk::WalkDir;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use symphonia_core::formats::FormatOptions;
+use symphonia_core::formats::probe::{Hint, Probe};
+use symphonia_core::io::MediaSourceStream;
+use symphonia_core::meta::{MetadataOptions, StandardTag};
+
+const BATCH_SIZE: usize = 50;
+
+pub fn spawn_library_scan(dir: PathBuf, tx: Sender<Vec<LibraryTrack>>) {
+    std::thread::spawn(move || {
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let probe = Probe::new();
+
+        for entry in WalkDir::new(&dir)
+            .sort(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            if let Some(track) = parse_symphonia_to_library_track(&path, &probe) {
+                batch.push(track);
+                if batch.len() >= BATCH_SIZE {
+                    if tx.send(std::mem::take(&mut batch)).is_err() {
+                        return;
+                    }
+                    batch.reserve(BATCH_SIZE);
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            let _ = tx.send(batch);
+        }
+    });
+}
+
+/// Derives a stable track ID from the canonical file path. Stable
+/// across rescans (unlike a random/sequential id), which is required
+/// for LibraryCache invalidation and redb keying to work correctly.
+
+fn track_id_for_path(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let hash_bytes = hasher.finalize();
+
+    // Convert the hash to a hex string and take the first 16 characters
+    hash_bytes
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<String>()
+        .chars()
+        .take(16)
+        .collect()
+}
+
+fn parse_symphonia_to_library_track(path: &Path, probe: &Probe) -> Option<LibraryTrack> {
+    let file = fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let mut format_reader = probe
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .ok()?;
+
+    let mut name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut artist = "Unknown Artist".to_string();
+    let mut album = "Unknown Album".to_string();
+    let mut year = None;
+
+    if let Some(metadata) = format_reader.metadata().current() {
+        for tag in &metadata.media.tags {
+            let Some(std_tag) = &tag.std else {
+                continue;
+            };
+            match std_tag {
+                StandardTag::TrackTitle(val) => name = val.to_string(),
+                StandardTag::Artist(val) => artist = val.to_string(),
+                StandardTag::Album(val) => album = val.to_string(),
+                StandardTag::RecordingYear(y) => year = Some(*y),
+                StandardTag::OriginalReleaseYear(y) => year = Some(*y),
+                _ => {}
+            }
+        }
+    }
+
+    let mut sample_rate = None;
+    let mut codec = None;
+    let mut duration_secs = 0;
+
+    if let Some(track) = format_reader.tracks().first() {
+        if let Some(params) = &track.codec_params {
+            if let Some(audio_params) = params.audio() {
+                sample_rate = audio_params.sample_rate;
+                codec = Some(format!("{:?}", audio_params.codec));
+                if let (Some(frames), Some(sample_rate)) = (track.num_frames, sample_rate) {
+                    if sample_rate > 0 {
+                        duration_secs = frames / sample_rate as u64;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(LibraryTrack {
+        id: track_id_for_path(path),
+        path: path.to_path_buf(),
+        name,
+        artist,
+        album,
+        year,
+        duration_secs,
+        size_bytes: path.metadata().ok()?.len(),
+        ext: path
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into(),
+        bitrate: None,
+        sample_rate,
+        codec,
+        rating: 0,
+        added_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    })
+}
+pub mod audio;
+mod config;
+pub mod core;
+pub mod fs;
+mod launcher;
+pub mod library;
+pub mod ui;
+mod worker;
+
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "osno2", about = "freeware terminal audio player")]
+struct Cli {
+    /// Internal flag: run as TUI worker inside a WezTerm window
+    #[arg(long, hide = true)]
+    worker: bool,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let result = if cli.worker {
+        worker::run()
+    } else {
+        launcher::run()
+    };
+
+    if let Err(e) = result {
+        eprintln!("osno2: {e}");
+        std::process::exit(1);
+    }
+}
+// src/ui/app.rs
+
+use crate::core::model::library_track::LibraryTrack;
+use crate::fs::fs_entry::{FsEntry, FsEntryKind};
+use crate::ui::renderer::AppLayout;
+use crossbeam_channel::Receiver;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::path::PathBuf;
+use tui_slider::SliderState;
+
+#[derive(Default, PartialEq, Debug, Clone, Copy)]
+pub enum ActiveView {
+    #[default]
+    Tracklist,
+    Filesystem,
+    Visualizer,
+    Settings,
+    Help,
+}
+
+/// Actions that the UI loop delegates up to the orchestration worker
+#[derive(Debug, Clone)]
+pub enum AppAction {
+    ExecuteCommand(String),
+    ToggleTerminalFocus,
+    None,
+}
+
+pub struct App {
+    pub active_view: ActiveView,
+
+    // Playback state
+    pub now_playing: String,
+    pub position_secs: u64,
+    pub duration_secs: u64,
+    pub playing_track: usize,
+    pub selected_track: usize,
+
+    // Library State
+    pub tracks: Vec<LibraryTrack>,
+    pub track_receiver: Option<Receiver<Vec<LibraryTrack>>>,
+
+    // Slider panel
+    pub volume_state: SliderState,
+
+    // Filesystem view [State only]
+    pub working_dir: PathBuf,
+    pub fs_entries: Vec<FsEntry>,
+    pub fs_selected: usize,
+
+    // Sandboxed Application REPL History
+    pub shell_history: Vec<String>,
+    pub shell_input: String,
+}
+
+impl App {
+    pub fn new() -> Self {
+        let state = SliderState::new(50.0, 0.0, 100.0);
+        Self {
+            active_view: ActiveView::default(),
+            now_playing: "[No Track Playing]".into(),
+            volume_state: state,
+            position_secs: 0,
+            duration_secs: 0,
+            playing_track: 0,
+            selected_track: 0,
+            tracks: Vec::new(),
+            track_receiver: None,
+            working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            fs_entries: Vec::new(),
+            fs_selected: 0,
+            shell_history: vec!["System operational. Type commands below.".into()],
+            shell_input: String::new(),
+        }
+    }
+
+    /// Drains the background library scanner channel for new tracks
+    /// Call this inside your main event loop before rendering.
+    pub fn poll_scanner(&mut self) {
+        if let Some(rx) = &self.track_receiver {
+            let mut new_data = false;
+            while let Ok(mut new_tracks) = rx.try_recv() {
+                self.tracks.append(&mut new_tracks);
+                new_data = true;
+            }
+
+            // Only sort if we actually appended new tracks this tick
+            if new_data {
+                self.tracks.sort_by(|a, b| {
+                    a.artist
+                        .cmp(&b.artist)
+                        .then(a.album.cmp(&b.album))
+                        .then(a.name.cmp(&b.name))
+                });
+            }
+        }
+    }
+
+    /// Kicks off a new background scan and hooks up the receiver
+    pub fn start_library_scan(&mut self, directory: PathBuf) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.track_receiver = Some(rx);
+        self.tracks.clear();
+
+        crate::library::scanner::spawn_library_scan(directory, tx);
+    }
+
+    pub fn draw(&mut self, frame: &mut ratatui::Frame, vt_screen: &tui_term::vt100::Screen) {
+        let layout = AppLayout::new(frame.area());
+        layout.render(frame, self, vt_screen);
+    }
+
+    /// Processes keyboard interactions and returns an optional action intent back up to the worker thread loop
+    pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
+        // Global App Interception: Alt+1 through Alt+5 changes active layout view tabs
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('1') => self.active_view = ActiveView::Tracklist,
+                KeyCode::Char('2') => self.active_view = ActiveView::Filesystem,
+                KeyCode::Char('3') => self.active_view = ActiveView::Visualizer,
+                KeyCode::Char('4') => self.active_view = ActiveView::Settings,
+                KeyCode::Char('5') => self.active_view = ActiveView::Help,
+                _ => {}
+            }
+            return AppAction::None;
+        }
+
+        // Global Appliance Interception: Ctrl+T signals to flip hardware focus boundaries
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+        {
+            return AppAction::ToggleTerminalFocus;
+        }
+
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match (key.code, shift) {
+            (KeyCode::Up, _) => {
+                self.handle_up();
+                AppAction::None
+            }
+            (KeyCode::Down, _) => {
+                self.handle_down();
+                AppAction::None
+            }
+            (KeyCode::Tab, _) => {
+                self.cycle_view();
+                AppAction::None
+            }
+            (KeyCode::Enter, _) => self.handle_enter(),
+            _ => {
+                self.handle_shell_input(key);
+                AppAction::None
+            }
+        }
+    }
+
+    fn handle_up(&mut self) {
+        match self.active_view {
+            ActiveView::Tracklist => self.selected_track = self.selected_track.saturating_sub(1),
+            ActiveView::Filesystem => self.fs_selected = self.fs_selected.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    fn handle_down(&mut self) {
+        match self.active_view {
+            ActiveView::Tracklist => {
+                if self.selected_track + 1 < self.tracks.len() {
+                    self.selected_track += 1;
+                }
+            }
+            ActiveView::Filesystem => {
+                if self.fs_selected + 1 < self.fs_entries.len() {
+                    self.fs_selected += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cycle_view(&mut self) {
+        self.active_view = match self.active_view {
+            ActiveView::Tracklist => ActiveView::Filesystem,
+            ActiveView::Filesystem => ActiveView::Visualizer,
+            ActiveView::Visualizer => ActiveView::Settings,
+            ActiveView::Settings => ActiveView::Help,
+            ActiveView::Help => ActiveView::Tracklist,
+        };
+    }
+
+    fn handle_enter(&mut self) -> AppAction {
+        match self.active_view {
+            ActiveView::Tracklist => {
+                if !self.tracks.is_empty() {
+                    let track = &self.tracks[self.selected_track];
+                    self.playing_track = self.selected_track;
+                    self.now_playing = format!("{} - {}", track.artist, track.name);
+                    AppAction::ExecuteCommand(format!("play {}", track.id))
+                } else {
+                    AppAction::None
+                }
+            }
+            ActiveView::Filesystem => {
+                if !self.fs_entries.is_empty() {
+                    let entry = &self.fs_entries[self.fs_selected];
+
+                    match entry.kind {
+                        FsEntryKind::Directory => {
+                            AppAction::ExecuteCommand(format!("cd {}", entry.path.display()))
+                        }
+                        FsEntryKind::AudioFile => {
+                            AppAction::ExecuteCommand(format!("play {}", entry.path.display()))
+                        }
+                        FsEntryKind::File => AppAction::None,
+                    }
+                } else {
+                    AppAction::None
+                }
+            }
+            _ => {
+                // Pressing enter on the sandboxed app REPL command bar
+                let input = self.shell_input.trim().to_string();
+                if !input.is_empty() {
+                    self.shell_history.push(format!("> {}", input));
+                    self.shell_input.clear();
+                    AppAction::ExecuteCommand(input)
+                } else {
+                    AppAction::None
+                }
+            }
+        }
+    }
+
+    fn handle_shell_input(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Backspace => {
+                self.shell_input.pop();
+            }
+            KeyCode::Char(c) => {
+                self.shell_input.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    // Helper formatting for playback timers
+    pub fn position_str(&self) -> String {
+        format_secs(self.position_secs)
+    }
+    pub fn duration_str(&self) -> String {
+        format_secs(self.duration_secs)
+    }
+}
+
+fn format_secs(secs: u64) -> String {
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+pub mod app;
+pub mod renderer;
+
+// Re-export the library module to make it available to other modules in ui
+pub use crate::library;
+use crate::ui::app::{ActiveView, App};
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Cell, Gauge, Padding, Paragraph, Row, Table},
+};
+use tui_slider::Slider;
+use tui_slider::style::SliderStyle;
+use tui_term::widget::PseudoTerminal;
+
+// Default Terminal Color Palette
+const _PALETTE_0: Color = Color::Rgb(0x33, 0x0d, 0x10); // darkest red-brown
+const PALETTE_1: Color = Color::Rgb(0x4d, 0x13, 0x0f);
+const PALETTE_2: Color = Color::Rgb(0x73, 0x20, 0x17);
+const PALETTE_3: Color = Color::Rgb(0x99, 0x28, 0x17);
+const PALETTE_4: Color = Color::Rgb(0xbf, 0x48, 0x1d);
+const PALETTE_5: Color = Color::Rgb(0xd9, 0x7e, 0x16);
+const _PALETTE_6: Color = Color::Rgb(0xe5, 0xbe, 0x22);
+const PALETTE_7: Color = Color::Rgb(0xf2, 0xe7, 0x49); // brightest yellow
+
+// Semantic aliases mapped onto palette
+const FG_BRIGHT: Color = PALETTE_7;
+const FG_ACCENT: Color = PALETTE_5;
+const FG_DIM: Color = PALETTE_4;
+const BORDER_DIM: Color = PALETTE_2;
+const BG_BLACK: Color = Color::Rgb(5, 5, 5);
+const BG_TRACK_ROW: Color = PALETTE_3;
+const BG_FILL: Color = PALETTE_1;
+
+pub struct AppLayout {
+    pub header: Rect,
+    pub main_view: Rect,
+    pub snackbar: Rect,
+    pub thumbnail: Rect,
+    pub snackbar_right: Rect,
+    pub progress: Rect,
+    pub metadata: Rect,
+    pub shell: Rect,
+}
+
+impl AppLayout {
+    pub fn new(area: Rect) -> Self {
+        let vertical = Layout::vertical([
+            Constraint::Length(3), // header
+            Constraint::Min(0),    // main view
+            Constraint::Length(8), // snackbar (album art / visualizer + duration + metadata)
+            Constraint::Length(6), // shell
+        ])
+        .split(area);
+
+        let snackbar = vertical[2];
+
+        // Square thumbnail slot on the left, sized to the snackbar's inner height.
+        // Block border consumes 2 rows/cols; terminal cells are ~2:1 (h:w), so
+        // width = 2 * inner_height keeps the slot visually square.
+        let inner_height = snackbar.height.saturating_sub(2);
+        let thumbnail_width = (inner_height * 2).clamp(1, snackbar.width.saturating_sub(1));
+
+        let snackbar_cols =
+            Layout::horizontal([Constraint::Length(thumbnail_width), Constraint::Min(0)])
+                .split(snackbar);
+
+        let thumbnail = snackbar_cols[0];
+        let snackbar_right = snackbar_cols[1];
+
+        let right_rows = Layout::vertical([
+            Constraint::Length(1), // duration / progress bar
+            Constraint::Min(0),    // metadata grid
+        ])
+        .split(snackbar_right);
+
+        Self {
+            header: vertical[0],
+            main_view: vertical[1],
+            snackbar,
+            thumbnail,
+            snackbar_right,
+            progress: right_rows[0],
+            metadata: right_rows[1],
+            shell: vertical[3],
+        }
+    }
+
+    /// UPDATE: Receives the live raw vt100 virtual screen buffer straight from the worker controller
+    pub fn render(&self, frame: &mut Frame, app: &mut App, vt_screen: &tui_term::vt100::Screen) {
+        self.render_header(frame, app);
+        self.render_main_view(frame, app);
+        self.render_audio_player(frame, app);
+        self.render_shell(frame, vt_screen); // UPDATE: Routed to terminal widget execution layer
+    }
+
+    fn render_header(&self, frame: &mut Frame, app: &App) {
+        let area = self.header;
+
+        let block = Block::bordered()
+            .border_style(Style::default().fg(BORDER_DIM))
+            .style(Style::default().bg(BG_BLACK));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let now_playing = format!(" Playing: {}", app.now_playing);
+        let vol_label = format!("vol {:?}% [osno2] ", app.volume_state.value());
+
+        let header_cols = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(vol_label.len() as u16),
+        ])
+        .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(now_playing).style(Style::default().fg(FG_BRIGHT).bg(BG_BLACK)),
+            header_cols[0],
+        );
+
+        frame.render_widget(
+            Paragraph::new(vol_label)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(FG_DIM).bg(BG_BLACK)),
+            header_cols[1],
+        );
+
+        let style = SliderStyle::minimal();
+        let slider = Slider::from_state(&app.volume_state)
+            .filled_color(style.filled_color)
+            .filled_symbol(style.filled_symbol);
+
+        frame.render_widget(slider, header_cols[1]);
+    }
+
+    fn render_main_view(&self, frame: &mut Frame, app: &App) {
+        match app.active_view {
+            ActiveView::Tracklist => self.render_tracklist(frame, app),
+            ActiveView::Filesystem => self.render_filesystem(frame, app),
+            ActiveView::Visualizer => self.render_visualizer_fullscreen(frame),
+            ActiveView::Settings => self.render_settings(frame),
+            ActiveView::Help => self.render_help(frame),
+        }
+    }
+
+    fn render_tracklist(&self, frame: &mut Frame, app: &App) {
+        let area = self.main_view;
+
+        let block = Block::bordered()
+            .title(" tracklist ")
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
+            .style(Style::default().bg(BG_TRACK_ROW));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let rows: Vec<Row> = app
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, track)| {
+                let is_playing = i == app.playing_track;
+                let is_selected = i == app.selected_track;
+
+                let row_style = if is_playing {
+                    Style::default().fg(FG_BRIGHT).bg(BG_BLACK)
+                } else if is_selected {
+                    Style::default().fg(FG_BRIGHT).bg(BG_FILL)
+                } else {
+                    Style::default().fg(BG_BLACK).bg(BG_TRACK_ROW)
+                };
+
+                let marker = if is_playing { "▶" } else { " " };
+
+                let duration_str = format!(
+                    "{:02}:{:02}",
+                    track.duration_secs / 60,
+                    track.duration_secs % 60
+                );
+                let year_str = track.year.map(|y| format!("({y})")).unwrap_or_default();
+
+                Row::new(vec![
+                    Cell::from(marker),
+                    Cell::from(duration_str),
+                    Cell::from(format!("{} {}", track.name, year_str)),
+                    Cell::from(track.artist.clone()),
+                    Cell::from(track.ext.clone()),
+                ])
+                .style(row_style)
+            })
+            .collect();
+
+        let widths = [
+            Constraint::Length(2),
+            Constraint::Length(6),
+            Constraint::Min(0),
+            Constraint::Length(20),
+            Constraint::Length(6),
+        ];
+
+        let table = Table::new(rows, widths)
+            .header(
+                Row::new(vec!["", "len", "title", "artist", "type"])
+                    .style(Style::default().fg(FG_BRIGHT).bg(BG_FILL).bold()),
+            )
+            .column_spacing(2);
+
+        frame.render_widget(table, inner);
+    }
+
+    fn render_filesystem(&self, frame: &mut Frame, app: &App) {
+        let block = Block::bordered()
+            .title(format!(" {} ", app.working_dir.display()))
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
+            .style(Style::default().bg(BG_BLACK));
+
+        let inner = block.inner(self.main_view);
+        frame.render_widget(block, self.main_view);
+
+        let entries: Vec<Line> = app
+            .fs_entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let style = if i == app.fs_selected {
+                    Style::default().fg(FG_BRIGHT).bg(BG_FILL)
+                } else if entry.is_dir {
+                    Style::default().fg(FG_BRIGHT)
+                } else {
+                    Style::default().fg(FG_DIM)
+                };
+
+                let display_name = if entry.is_dir {
+                    format!("{}/", entry.name)
+                } else {
+                    entry.name.clone()
+                };
+
+                Line::styled(format!(" {display_name}"), style)
+            })
+            .collect();
+
+        frame.render_widget(
+            Paragraph::new(entries).style(Style::default().bg(BG_BLACK)),
+            inner,
+        );
+    }
+
+    fn render_visualizer_fullscreen(&self, frame: &mut Frame) {
+        let block = Block::bordered()
+            .title(" visualizer ")
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
+            .style(Style::default().bg(BG_BLACK));
+
+        let inner = block.inner(self.main_view);
+        frame.render_widget(block, self.main_view);
+
+        let dots = render_dot_grid(inner, &[]);
+        frame.render_widget(
+            Paragraph::new(dots).style(Style::default().bg(BG_BLACK)),
+            inner,
+        );
+    }
+
+    fn render_settings(&self, frame: &mut Frame) {
+        let block = Block::bordered()
+            .title(" settings ")
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
+            .style(Style::default().bg(BG_BLACK));
+
+        frame.render_widget(
+            Paragraph::new(" settings not yet implemented")
+                .style(Style::default().fg(FG_DIM).bg(BG_BLACK))
+                .block(block),
+            self.main_view,
+        );
+    }
+
+    fn render_help(&self, frame: &mut Frame) {
+        let content = vec![
+            Line::styled(" keybindings", Style::default().fg(FG_BRIGHT).bold()),
+            Line::raw(""),
+            Line::styled(" Alt+1   tracklist", Style::default().fg(FG_DIM)),
+            Line::styled(" Alt+2   filesystem", Style::default().fg(FG_DIM)),
+            Line::styled(" Alt+3   visualizer", Style::default().fg(FG_DIM)),
+            Line::styled(" Alt+4   settings", Style::default().fg(FG_DIM)),
+            Line::styled(" Alt+5   help", Style::default().fg(FG_DIM)),
+            Line::raw(""),
+            Line::styled(" shell commands", Style::default().fg(FG_BRIGHT).bold()),
+            Line::raw(""),
+            Line::styled(
+                " cd <path>        change directory",
+                Style::default().fg(FG_DIM),
+            ),
+            Line::styled(
+                " ls               list directory",
+                Style::default().fg(FG_DIM),
+            ),
+            Line::styled(" play <query>     play track", Style::default().fg(FG_DIM)),
+            Line::styled(
+                " queue <query>    add to queue",
+                Style::default().fg(FG_DIM),
+            ),
+            Line::styled(" volume <0-100>   set volume", Style::default().fg(FG_DIM)),
+            Line::styled(
+                " purge            clear library index",
+                Style::default().fg(FG_DIM),
+            ),
+            Line::raw(""),
+            Line::styled(" q / Ctrl+C       quit", Style::default().fg(FG_DIM)),
+        ];
+
+        let block = Block::bordered()
+            .title(" help ")
+            .title_style(Style::default().fg(FG_BRIGHT))
+            .border_style(Style::default().fg(BORDER_DIM))
+            .style(Style::default().bg(BG_BLACK));
+
+        frame.render_widget(
+            Paragraph::new(content)
+                .style(Style::default().bg(BG_BLACK))
+                .block(block),
+            self.main_view,
+        );
+    }
+
+    fn render_audio_player(&self, frame: &mut Frame, app: &App) {
+        let block = Block::bordered()
+            .title(" Player ")
+            .title_style(Style::default().fg(FG_BRIGHT).bold())
+            .border_style(Style::default().fg(BORDER_DIM))
+            .style(Style::default().bg(BG_BLACK));
+
+        let inner = block.inner(self.snackbar);
+        frame.render_widget(block, self.snackbar);
+
+        let inner_cols =
+            Layout::horizontal([Constraint::Length(self.thumbnail.width), Constraint::Min(0)])
+                .split(inner);
+
+        // 1-cell gap between thumbnail and the right column
+        let right_block = Block::default().padding(Padding::left(1));
+        let left_block = Block::default().padding(Padding::left(1));
+
+        let right_area = right_block.inner(inner_cols[1]);
+        let left_area = left_block.inner(inner_cols[0]);
+
+        let inner_left =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(left_area);
+
+        let inner_right =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(right_area);
+
+        self.render_thumbnail(frame, inner_left[0]);
+        self.render_progress(frame, app, inner_right[0]);
+        self.render_metadata(frame, app, inner_right[1]);
+    }
+
+    /// Square slot showing either the spectrum visualizer or album art thumbnail.
+    /// Currently always renders the visualizer placeholder; swap on `app` state
+    /// once album art loading lands.
+
+    fn render_thumbnail(&self, frame: &mut Frame, area: Rect) {
+        let dots = render_dot_grid(area, &[]);
+
+        frame.render_widget(
+            Paragraph::new(dots).style(Style::default().bg(BG_BLACK)),
+            area,
+        );
+    }
+
+    fn render_progress(&self, frame: &mut Frame, app: &App, area: Rect) {
+        let label = format!("{} / {}", app.position_str(), app.duration_str());
+
+        let ratio = if app.duration_secs > 0 {
+            (app.position_secs as f64 / app.duration_secs as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(FG_BRIGHT).bg(BG_FILL))
+            .ratio(ratio)
+            .label(Span::styled(label, Style::default().fg(FG_ACCENT)));
+
+        frame.render_widget(gauge, area);
+    }
+
+    fn render_metadata(&self, frame: &mut Frame, app: &App, area: Rect) {
+        let block = Block::default().padding(Padding::top(1));
+        let area = block.inner(area);
+
+        let cols = Layout::horizontal([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(area);
+
+        let mut col1 = vec![];
+        let mut col2 = vec![];
+        let mut col3 = vec![];
+
+        if !app.tracks.is_empty() && app.selected_track < app.tracks.len() {
+            let t = &app.tracks[app.selected_track];
+
+            // These strings are created inside the block, but that's fine now!
+            let sr = &t.clone().sample_rate.unwrap_or(0).to_string();
+            let stars = "★".repeat(t.rating as usize)
+                + &"☆".repeat(5_usize.saturating_sub(t.rating as usize));
+
+            col1 = vec![
+                meta_line("Title", &t.name),
+                meta_line("Artist", &t.artist),
+                meta_line("Album", &t.album),
+                meta_line("Codec", t.codec.as_deref().unwrap_or("N/A")),
+            ];
+
+            col2 = vec![
+                meta_line("Track", "0"),
+                meta_line("Sample Rate", sr),
+                meta_line(
+                    "Bitrate",
+                    &t.bitrate
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "N/A".to_string()),
+                ),
+            ];
+
+            col3 = vec![
+                meta_line("Added", &t.added_at.to_string()),
+                meta_line("Size", &format!("{} bytes", t.size_bytes)),
+                meta_line(
+                    "Year",
+                    &t.year
+                        .map(|y| y.to_string())
+                        .unwrap_or_else(|| "N/A".to_string()),
+                ),
+                meta_line("Rating", &stars),
+            ];
+        }
+
+        // Now this works perfectly because col1, col2, and col3 own their strings!
+        frame.render_widget(
+            Paragraph::new(col1).style(Style::default().bg(BG_BLACK)),
+            cols[0],
+        );
+        frame.render_widget(
+            Paragraph::new(col2).style(Style::default().bg(BG_BLACK)),
+            cols[1],
+        );
+        frame.render_widget(
+            Paragraph::new(col3).style(Style::default().bg(BG_BLACK)),
+            cols[2],
+        );
+    }
+
+    /// UPDATE: Replaces old custom paragraph rendering with the live tui-term widget.
+    fn render_shell(&self, frame: &mut Frame, vt_screen: &tui_term::vt100::Screen) {
+        let block = Block::bordered()
+            .title(" OS INTERACTIVE CONSOLE (Ctrl+T) ")
+            .title_style(Style::default().fg(FG_BRIGHT).bold())
+            .border_style(Style::default().fg(BORDER_DIM))
+            .style(Style::default().bg(BG_BLACK));
+
+        let terminal_widget = PseudoTerminal::new(vt_screen).block(block);
+
+        frame.render_widget(terminal_widget, self.shell);
+    }
+}
+
+fn render_dot_grid(area: Rect, buckets: &[f32]) -> Vec<Line<'static>> {
+    let cols = area.width as usize;
+    let rows = area.height as usize;
+
+    (0..rows)
+        .map(|row| {
+            let spans: Vec<Span> = (0..cols)
+                .map(|col| {
+                    let magnitude = if buckets.is_empty() {
+                        0.0
+                    } else {
+                        let idx = (col * buckets.len()) / cols.max(1);
+                        buckets.get(idx).copied().unwrap_or(0.0)
+                    };
+
+                    let threshold = 1.0 - (row as f32 / rows.saturating_sub(1).max(1) as f32);
+                    let lit = magnitude >= threshold;
+
+                    if lit {
+                        Span::styled("•", Style::default().fg(FG_BRIGHT))
+                    } else {
+                        Span::styled("·", Style::default().fg(BORDER_DIM))
+                    }
+                })
+                .collect();
+
+            Line::from(spans)
+        })
+        .collect()
+}
+fn meta_line(key: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {key}: "), Style::default().fg(FG_DIM)),
+        Span::styled(value.to_string(), Style::default().fg(FG_BRIGHT)),
+    ])
+}
+use ansi_control_codes::c0::{CR, ESC, HT};
+use ansi_control_codes::control_sequences::{CNL, CPL, CUB, CUD, CUF, CUU};
+use std::sync::LazyLock;
+
+// ANSI escape sequences for terminal control characters
+static SEQ_BACKSPACE: LazyLock<Vec<u8>> = LazyLock::new(|| vec![0x7F]);
+static SEQ_ENTER: LazyLock<Vec<u8>> = LazyLock::new(|| CR.to_string().into_bytes());
+static SEQ_TAB: LazyLock<Vec<u8>> = LazyLock::new(|| HT.to_string().into_bytes());
+static SEQ_ESC: LazyLock<Vec<u8>> = LazyLock::new(|| ESC.to_string().into_bytes());
+static SEQ_UP: LazyLock<Vec<u8>> = LazyLock::new(|| CUU(1.into()).to_string().into_bytes());
+static SEQ_DOWN: LazyLock<Vec<u8>> = LazyLock::new(|| CUD(1.into()).to_string().into_bytes());
+static SEQ_RIGHT: LazyLock<Vec<u8>> = LazyLock::new(|| CUF(1.into()).to_string().into_bytes());
+static SEQ_LEFT: LazyLock<Vec<u8>> = LazyLock::new(|| CUB(1.into()).to_string().into_bytes());
+static SEQ_HOME: LazyLock<Vec<u8>> = LazyLock::new(|| CPL(1.into()).to_string().into_bytes());
+static SEQ_END: LazyLock<Vec<u8>> = LazyLock::new(|| CNL(1.into()).to_string().into_bytes());
+
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+
+use parking_lot::RwLock;
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use ratatui::prelude::*;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+// Pull the exact 0.2.0 components out of tui-term
+use vt100::Parser;
+
+use crate::library::library_service::LibraryService;
+use crate::ui::app::{ActiveView, App, AppAction};
+
+/// The conceptual focus boundaries for our input dispatch matrix
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFocus {
+    App,
+    Terminal,
+}
+
+/// Unified event tracking enum passing up from background threads to the main UI thread
+pub enum AppEvent {
+    KeyEvent(KeyEvent),
+    TerminalOutput,
+    Resize(u16, u16),
+    LibraryScanProgress(u64),
+    LibraryScanComplete,
+}
+
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let _guard = rt.enter();
+    let mut terminal = setup_terminal()?;
+
+    let app_paths = crate::config::paths::AppPaths::resolve();
+    let db = redb::Database::create(app_paths.config_dir.join("library/index.db"))?;
+    let library_service = LibraryService::new(
+        db,
+        app_paths.config_dir.join("library"),
+        app_paths.config_dir.join("playlists"),
+    );
+
+    let result = event_loop(&mut terminal, library_service, rt.handle().clone());
+    teardown_terminal(&mut terminal)?;
+    result
+}
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, io::Error> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+fn teardown_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<(), io::Error> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    library_service: LibraryService,
+    tokio_handle: tokio::runtime::Handle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (event_tx, event_rx) = crossbeam_channel::unbounded::<AppEvent>();
+
+    let pty_system = NativePtySystem::default();
+    let size = terminal.size()?;
+    let pty_pair = pty_system.openpty(PtySize {
+        rows: size.height,
+        cols: size.width,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    #[cfg(target_os = "windows")]
+    let cmd = CommandBuilder::new("powershell.exe");
+
+    #[cfg(not(target_os = "windows"))]
+    let cmd = CommandBuilder::with_argv(vec![
+        std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string()),
+        "-i".to_string(),
+    ]);
+
+    let _child = pty_pair.slave.spawn_command(cmd)?;
+
+    let mut pty_writer = pty_pair.master.take_writer()?;
+
+    let pty_reader = pty_pair.master.try_clone_reader()?;
+
+    // Initialize the vt100 Parser state machine.
+    // Arguments: (rows, cols, scrollback_lines) -> 1000 lines of scrollback memory
+    let vt_parser = Arc::new(RwLock::new(Parser::new(size.height, size.width, 1000)));
+
+    let vt_writer_clone = Arc::clone(&vt_parser);
+
+    let tx_terminal = event_tx.clone();
+
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(pty_reader);
+        let mut buffer = [0u8; 8192];
+        while let Ok(n) = std::io::Read::read(&mut reader, &mut buffer) {
+            if n == 0 {
+                break;
+            }
+
+            // vt100::Parser implements std::io::Write
+            let _ = vt_writer_clone.write().write_all(&buffer[..n]);
+            let _ = tx_terminal.send(AppEvent::TerminalOutput);
+        }
+    });
+
+    let tx_crossterm = event_tx.clone();
+
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(true) = event::poll(std::time::Duration::from_millis(200)) {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if key.kind == KeyEventKind::Press {
+                            let _ = tx_crossterm.send(AppEvent::KeyEvent(key));
+                        }
+                    }
+                    Ok(Event::Resize(cols, rows)) => {
+                        let _ = tx_crossterm.send(AppEvent::Resize(cols, rows));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let mut app = App::new();
+
+    let mut current_focus = InputFocus::App;
+
+    if let Ok(entries) = library_service.read_dir(&app.working_dir) {
+        app.fs_entries = entries;
+    }
+
+    terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
+
+    for event in event_rx.clone() {
+        match event {
+            AppEvent::TerminalOutput => {
+                if event_rx.is_empty() {
+                    terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
+                }
+            }
+            AppEvent::Resize(cols, rows) => {
+                // Tell the OS/PTY the terminal size changed
+                let _ = pty_pair.master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+
+                let mut parser_guard = vt_parser.write();
+                *parser_guard = Parser::new(rows, cols, 1000);
+
+                // Drop the guard immediately after re-assigning
+                drop(parser_guard);
+
+                // 3. Draw
+                terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
+            }
+            AppEvent::LibraryScanProgress(_progress) => {}
+            AppEvent::LibraryScanComplete => {}
+            AppEvent::KeyEvent(key) => {
+                if should_quit(key) {
+                    return Ok(());
+                }
+
+                match current_focus {
+                    InputFocus::App => match app.handle_key(key) {
+                        AppAction::ToggleTerminalFocus => {
+                            current_focus = InputFocus::Terminal;
+                            terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
+                        }
+                        AppAction::ExecuteCommand(cmd_str) => {
+                            execute_app_command(
+                                &mut app,
+                                &cmd_str,
+                                &library_service,
+                                &tokio_handle,
+                            );
+                            terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
+                        }
+                        AppAction::None => {
+                            terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
+                        }
+                    },
+                    InputFocus::Terminal => {
+                        // Global appliance override interception inside terminal view context
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+                        {
+                            current_focus = InputFocus::App;
+                            terminal.draw(|frame| app.draw(frame, vt_parser.read().screen()))?;
+                        } else {
+                            // UPDATE: Passes Crossterm keys cleanly into our explicit translation function
+                            handle_terminal_key(key, &mut pty_writer);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn execute_app_command(
+    app: &mut App,
+    cmd: &str,
+    library: &LibraryService,
+    _rt: &tokio::runtime::Handle,
+) {
+    let history_line = format!("{}/ {}", app.working_dir.display(), cmd);
+    app.shell_history.push(history_line);
+
+    let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
+    match parts.as_slice() {
+        ["cd", target_path] => {
+            let raw_path = PathBuf::from(target_path);
+            let target = if raw_path.starts_with("/") {
+                raw_path
+            } else {
+                app.working_dir.join(raw_path)
+            };
+            match library.read_dir(&target) {
+                Ok(new_entries) => {
+                    app.working_dir = dunce::canonicalize(&target).unwrap_or(target);
+                    app.fs_entries = new_entries;
+                    if app.active_view == ActiveView::Filesystem {
+                        app.fs_selected = 0;
+                    }
+                }
+                Err(e) => app.shell_history.push(format!("  cd error: {e}")),
+            }
+        }
+        ["ls"] => {
+            if let Ok(entries) = library.read_dir(&app.working_dir) {
+                app.fs_entries = entries;
+            }
+        }
+        ["play", query] => {
+            app.now_playing = query.to_string();
+        }
+        ["volume", level] => {
+            if let Ok(v) = level.parse::<u8>() {
+                if v <= 100 {
+                    app.volume_state.set_from_position(v as u16, 100);
+                }
+            }
+        }
+        ["view", target] => match *target {
+            "tracklist" | "1" => app.active_view = ActiveView::Tracklist,
+            "filesystem" | "2" => app.active_view = ActiveView::Filesystem,
+            "visualizer" | "3" => app.active_view = ActiveView::Visualizer,
+            "settings" | "4" => app.active_view = ActiveView::Settings,
+            "help" | "5" => app.active_view = ActiveView::Help,
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn handle_terminal_key(key: KeyEvent, pty_writer: &mut Box<dyn std::io::Write + Send>) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(c) = key.code {
+            let byte = c.to_ascii_uppercase() as u8 - b'A' + 1;
+            let _ = pty_writer.write_all(&[byte]);
+            let _ = pty_writer.flush();
+            return;
+        }
+    }
+
+    let seq: Option<&[u8]> = match key.code {
+        KeyCode::Char(c) => {
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            let _ = pty_writer.write_all(s.as_bytes());
+            let _ = pty_writer.flush();
+            return;
+        }
+        KeyCode::Enter => Some(&SEQ_ENTER),
+        KeyCode::Tab => Some(&SEQ_TAB),
+        KeyCode::Backspace => Some(&SEQ_BACKSPACE),
+        KeyCode::Esc => Some(&SEQ_ESC),
+        KeyCode::Up => Some(&SEQ_UP),
+        KeyCode::Down => Some(&SEQ_DOWN),
+        KeyCode::Right => Some(&SEQ_RIGHT),
+        KeyCode::Left => Some(&SEQ_LEFT),
+        KeyCode::Home => Some(&SEQ_HOME),
+        KeyCode::End => Some(&SEQ_END),
+        _ => None,
+    };
+
+    if let Some(bytes) = seq {
+        let _ = pty_writer.write_all(bytes);
+        let _ = pty_writer.flush();
+    }
+}
+
+fn should_quit(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+}

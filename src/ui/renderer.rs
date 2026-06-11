@@ -8,22 +8,22 @@ use tui_slider::style::SliderStyle;
 use tui_term::widget::PseudoTerminal;
 
 // Default Terminal Color Palette
-const _PALETTE_0: Color = Color::Rgb(0x33, 0x0d, 0x10); // darkest red-brown
-const PALETTE_1: Color = Color::Rgb(0x4d, 0x13, 0x0f);
-const PALETTE_2: Color = Color::Rgb(0x73, 0x20, 0x17);
-const PALETTE_3: Color = Color::Rgb(0x99, 0x28, 0x17);
-const PALETTE_4: Color = Color::Rgb(0xbf, 0x48, 0x1d);
-const PALETTE_5: Color = Color::Rgb(0xd9, 0x7e, 0x16);
-const _PALETTE_6: Color = Color::Rgb(0xe5, 0xbe, 0x22);
-const PALETTE_7: Color = Color::Rgb(0xf2, 0xe7, 0x49); // brightest yellow
+const PALETTE_0: Color = Color::Rgb(0x04, 0x0c, 0x06); // darkest
+const PALETTE_1: Color = Color::Rgb(0x11, 0x23, 0x18);
+const PALETTE_2: Color = Color::Rgb(0x1e, 0x3a, 0x29);
+const PALETTE_3: Color = Color::Rgb(0x30, 0x5d, 0x42);
+const PALETTE_4: Color = Color::Rgb(0x4d, 0x80, 0x61);
+const PALETTE_5: Color = Color::Rgb(0x89, 0xa2, 0x57);
+const PALETTE_6: Color = Color::Rgb(0xbe, 0xdc, 0x7f);
+const PALETTE_7: Color = Color::Rgb(0xee, 0xff, 0xcc); // brightest
 
 // Semantic aliases mapped onto palette
 const FG_BRIGHT: Color = PALETTE_7;
-const FG_ACCENT: Color = PALETTE_5;
+const FG_ACCENT: Color = PALETTE_6;
 const FG_DIM: Color = PALETTE_4;
-const BORDER_DIM: Color = PALETTE_2;
-const BG_BLACK: Color = Color::Rgb(5, 5, 5);
-const BG_TRACK_ROW: Color = PALETTE_3;
+const BORDER_DIM: Color = PALETTE_3;
+const BG_BLACK: Color = PALETTE_0;
+const BG_TRACK_ROW: Color = PALETTE_2;
 const BG_FILL: Color = PALETTE_1;
 
 pub struct AppLayout {
