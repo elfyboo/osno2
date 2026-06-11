@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::core::model::library_playlist::LibraryPlaylist;
+use crate::core::model::library_track::LibraryTrack;
 use crate::fs::fs_entry::{FsEntry, FsEntryKind};
-use crate::library::library_playlist::LibraryPlaylist;
-use crate::library::library_track::LibraryTrack;
+
 use jwalk::WalkDir;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use symphonia::core::formats::FormatOptions;

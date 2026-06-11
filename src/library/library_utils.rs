@@ -3,19 +3,8 @@ use symphonia::core::codecs::audio::well_known as audio_codecs;
 use symphonia::core::codecs::subtitle::well_known as subtitle_codecs;
 use symphonia::core::codecs::video::well_known as video_codecs;
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum LibraryTrackType {
-    Audio,
-    Video,
-    Subtitle,
-}
-
-pub struct CodecInformation {
-    pub codec_id: CodecId,
-    pub track_type: LibraryTrackType,
-    pub str_codec_id: &'static str,
-    pub str_track_type: &'static str,
-}
+use crate::core::model::codec_information::CodecInformation;
+use crate::core::model::library_track::LibraryTrackType;
 
 pub fn get_codec_info(codec_id: &CodecId) -> Option<CodecInformation> {
     match codec_id {

@@ -1,7 +1,7 @@
 // src/ui/app.rs
 
+use crate::core::model::library_track::LibraryTrack;
 use crate::fs::fs_entry::{FsEntry, FsEntryKind};
-use crate::library::library_track::LibraryTrack;
 use crate::ui::renderer::AppLayout;
 use crossbeam_channel::Receiver;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

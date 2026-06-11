@@ -774,6 +774,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "futures-task"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -786,6 +797,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
+ "futures-macro",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -1537,6 +1549,8 @@ dependencies = [
  "crossterm",
  "directories",
  "dunce",
+ "futures-core",
+ "futures-util",
  "jwalk",
  "mime_guess",
  "notify",
@@ -1548,9 +1562,11 @@ dependencies = [
  "ringbuf",
  "rustfft",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "symphonia",
  "symphonia-core",
+ "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tui-slider",

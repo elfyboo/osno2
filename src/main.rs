@@ -1,3 +1,4 @@
+pub mod audio;
 mod config;
 pub mod core;
 pub mod fs;

@@ -1,4 +1,9 @@
+pub mod codec_information;
 pub mod library;
+pub mod library_playlist;
+pub mod library_track;
+pub mod reducer;
 pub mod scrollback;
 pub mod state;
 pub mod store;
+pub mod view_state;

@@ -18,3 +18,10 @@ pub struct LibraryTrack {
     pub rating: u8,    // 0-5
     pub added_at: u64, // unix timestamp
 }
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum LibraryTrackType {
+    Audio,
+    Video,
+    Subtitle,
+}
