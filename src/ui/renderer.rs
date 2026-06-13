@@ -23,6 +23,11 @@ const BG_BLACK: Color = _COLOR_DARKEST;
 const BG_TRACK_ROW: Color = _COLOR_DARKEST;
 const BG_FILL: Color = _COLOR_DARKEST;
 
+// Layout tuning constants
+const PLAYER_HEADER_HEIGHT: u16 = 3;
+const PLAYER_BODY_HEIGHT: u16 = 8;
+const PLAYER_HEIGHT: u16 = PLAYER_HEADER_HEIGHT + PLAYER_BODY_HEIGHT;
+
 pub struct AppLayout {
     pub header: Rect,
     pub main_view: Rect,
@@ -36,15 +41,33 @@ pub struct AppLayout {
 
 impl AppLayout {
     pub fn new(area: Rect) -> Self {
+        // Top row: player widget, fixed height, always visible.
+        // Middle row: modal view (tracklist/filesystem/etc), flexible height.
+        // Bottom row: console, gets the majority of remaining space by
+        // default but never shrinks below 1/3 of the total screen height.
+        let player_height = PLAYER_HEIGHT.min(area.height);
+        let remaining = area.height - player_height;
+
+        let min_shell_height = area.height / 3;
+        let shell_height = (remaining * 2 / 3).max(min_shell_height).min(remaining);
+        let main_view_height = remaining - shell_height;
+
         let vertical = Layout::vertical([
-            Constraint::Length(3), // header
-            Constraint::Min(0),    // main view
-            Constraint::Length(8), // snackbar (album art / visualizer + duration + metadata)
-            Constraint::Length(6), // shell
+            Constraint::Length(player_height),
+            Constraint::Length(main_view_height),
+            Constraint::Length(shell_height),
         ])
         .split(area);
 
-        let snackbar = vertical[2];
+        // Player band still splits into a header row + body, as before.
+        let player_rows = Layout::vertical([
+            Constraint::Length(PLAYER_HEADER_HEIGHT.min(vertical[0].height)),
+            Constraint::Min(0),
+        ])
+        .split(vertical[0]);
+
+        let header = player_rows[0];
+        let snackbar = player_rows[1];
 
         // Square thumbnail slot on the left, sized to the snackbar's inner height.
         // Block border consumes 2 rows/cols; terminal cells are ~2:1 (h:w), so
@@ -66,14 +89,14 @@ impl AppLayout {
         .split(snackbar_right);
 
         Self {
-            header: vertical[0],
+            header,
             main_view: vertical[1],
             snackbar,
             thumbnail,
             snackbar_right,
             progress: right_rows[0],
             metadata: right_rows[1],
-            shell: vertical[3],
+            shell: vertical[2],
         }
     }
 
@@ -399,7 +422,6 @@ impl AppLayout {
         if !app.tracks.is_empty() && app.selected_track < app.tracks.len() {
             let t = &app.tracks[app.selected_track];
 
-            // These strings are created inside the block, but that's fine now!
             let sr = &t.clone().sample_rate.unwrap_or(0).to_string();
             let stars = "★".repeat(t.rating as usize)
                 + &"☆".repeat(5_usize.saturating_sub(t.rating as usize));
@@ -435,7 +457,6 @@ impl AppLayout {
             ];
         }
 
-        // Now this works perfectly because col1, col2, and col3 own their strings!
         frame.render_widget(
             Paragraph::new(col1).style(Style::default().bg(BG_BLACK)),
             cols[0],
@@ -494,6 +515,7 @@ fn render_dot_grid(area: Rect, buckets: &[f32]) -> Vec<Line<'static>> {
         })
         .collect()
 }
+
 fn meta_line(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!(" {key}: "), Style::default().fg(FG_DIM)),
