@@ -1,0 +1,90 @@
+.
+├── Cargo.lock
+├── Cargo.toml
+├── LICENSE
+├── assets
+│   ├── default_config.toml
+│   └── wezterm.lua
+├── design
+│   ├── Gemini_Generated_Image_eai31peai31peai3.png
+│   ├── Untadadaditled.jpg
+│   ├── Untidadadtled.jpg
+│   ├── Untitled.jpg
+│   ├── beta_layout.png
+│   ├── concept2.aseprite
+│   ├── design.md
+│   ├── logo_base.png
+│   ├── logo_base_file.aseprite
+│   ├── logo_base_file_64.aseprite
+│   ├── logo_base_file_small.aseprite
+│   ├── logo_base_file_smallest.aseprite
+│   ├── logo_base_palette.png
+│   ├── logo_base_palette_2.aseprite
+│   ├── logo_base_palette_small.png
+│   ├── notes
+│   │   ├── design_spec.md
+│   │   ├── library-model.md
+│   │   └── pipeline.md
+│   ├── snackbar-big.png
+│   └── snackbar.png
+├── dev_env
+│   └── config
+│       ├── library
+│       ├── playlists
+│       └── wezterm.lua
+├── scripts
+│   └── setup.sh
+├── snapshots
+│   ├── snapshot.txt
+│   └── source.txt
+├── source_directory.txt
+└── src
+    ├── audio
+    │   ├── audio_engine.rs
+    │   ├── audio_state.rs
+    │   └── mod.rs
+    ├── config
+    │   ├── mod.rs
+    │   └── paths.rs
+    ├── core
+    │   ├── controller
+    │   │   ├── event_bus.rs
+    │   │   ├── events.rs
+    │   │   ├── input.rs
+    │   │   └── mod.rs
+    │   ├── mod.rs
+    │   ├── model
+    │   │   ├── codec_information.rs
+    │   │   ├── library.rs
+    │   │   ├── library_playlist.rs
+    │   │   ├── library_track.rs
+    │   │   ├── mod.rs
+    │   │   ├── reducer.rs
+    │   │   ├── scrollback.rs
+    │   │   ├── state.rs
+    │   │   ├── store.rs
+    │   │   └── view_state.rs
+    │   └── view
+    │       ├── frontend.rs
+    │       ├── mod.rs
+    │       ├── web
+    │       └── widgets
+    ├── fs
+    │   ├── fs_entry.rs
+    │   └── mod.rs
+    ├── ipc
+    │   └── mod.rs
+    ├── launcher.rs
+    ├── library
+    │   ├── library_service.rs
+    │   ├── library_utils.rs
+    │   ├── mod.rs
+    │   └── scanner.rs
+    ├── main.rs
+    ├── ui
+    │   ├── app.rs
+    │   ├── mod.rs
+    │   └── renderer.rs
+    └── worker.rs
+
+23 directories, 65 files
