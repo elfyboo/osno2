@@ -3,8 +3,6 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Cell, Gauge, Padding, Paragraph, Row, Table},
 };
-use tui_slider::Slider;
-use tui_slider::style::SliderStyle;
 use tui_term::widget::PseudoTerminal;
 
 // Default Terminal Color Palette
@@ -23,13 +21,14 @@ const BG_BLACK: Color = _COLOR_DARKEST;
 const BG_TRACK_ROW: Color = _COLOR_DARKEST;
 const BG_FILL: Color = _COLOR_DARKEST;
 
-// Layout tuning constants
-const PLAYER_HEADER_HEIGHT: u16 = 3;
-const PLAYER_BODY_HEIGHT: u16 = 8;
-const PLAYER_HEIGHT: u16 = PLAYER_HEADER_HEIGHT + PLAYER_BODY_HEIGHT;
+// Tunables for the player/console band heights (both bands share the same
+// height). Default height is `area.height / MIN_BAND_HEIGHT_DIVISOR`,
+// capped at `MAX_BAND_HEIGHT_CELLS`. Increase the divisor or lower the cap
+// to give more space to the modal view in the middle.
+const MIN_BAND_HEIGHT_DIVISOR: u16 = 4;
+const MAX_BAND_HEIGHT_CELLS: u16 = 16;
 
 pub struct AppLayout {
-    pub header: Rect,
     pub main_view: Rect,
     pub snackbar: Rect,
     pub thumbnail: Rect,
@@ -41,33 +40,26 @@ pub struct AppLayout {
 
 impl AppLayout {
     pub fn new(area: Rect) -> Self {
-        // Top row: player widget, fixed height, always visible.
-        // Middle row: modal view (tracklist/filesystem/etc), flexible height.
-        // Bottom row: console, gets the majority of remaining space by
-        // default but never shrinks below 1/3 of the total screen height.
-        let player_height = PLAYER_HEIGHT.min(area.height);
-        let remaining = area.height - player_height;
+        // 1-cell padding around the entire TUI.
+        let area = area.inner(Margin::new(1, 1));
 
-        let min_shell_height = area.height / 3;
-        let shell_height = (remaining * 2 / 3).max(min_shell_height).min(remaining);
-        let main_view_height = remaining - shell_height;
+        // Top row: player, bottom row: console. Both share the same height,
+        // defaulting to 1/3 of the total screen height and capped at
+        // MAX_BAND_HEIGHT. The modal view in between flexes to fill
+        // whatever space is left.
+        let band_height = (area.height / MIN_BAND_HEIGHT_DIVISOR)
+            .min(MAX_BAND_HEIGHT_CELLS)
+            .min(area.height / 2);
+        let main_view_height = area.height - 2 * band_height;
 
         let vertical = Layout::vertical([
-            Constraint::Length(player_height),
+            Constraint::Length(band_height),
             Constraint::Length(main_view_height),
-            Constraint::Length(shell_height),
+            Constraint::Length(band_height),
         ])
         .split(area);
 
-        // Player band still splits into a header row + body, as before.
-        let player_rows = Layout::vertical([
-            Constraint::Length(PLAYER_HEADER_HEIGHT.min(vertical[0].height)),
-            Constraint::Min(0),
-        ])
-        .split(vertical[0]);
-
-        let header = player_rows[0];
-        let snackbar = player_rows[1];
+        let snackbar = vertical[0];
 
         // Square thumbnail slot on the left, sized to the snackbar's inner height.
         // Block border consumes 2 rows/cols; terminal cells are ~2:1 (h:w), so
@@ -89,7 +81,6 @@ impl AppLayout {
         .split(snackbar_right);
 
         Self {
-            header,
             main_view: vertical[1],
             snackbar,
             thumbnail,
@@ -102,49 +93,9 @@ impl AppLayout {
 
     /// UPDATE: Receives the live raw vt100 virtual screen buffer straight from the worker controller
     pub fn render(&self, frame: &mut Frame, app: &mut App, vt_screen: &tui_term::vt100::Screen) {
-        self.render_header(frame, app);
         self.render_main_view(frame, app);
         self.render_audio_player(frame, app);
         self.render_shell(frame, vt_screen); // UPDATE: Routed to terminal widget execution layer
-    }
-
-    fn render_header(&self, frame: &mut Frame, app: &App) {
-        let area = self.header;
-
-        let block = Block::bordered()
-            .border_style(Style::default().fg(BORDER_DIM))
-            .style(Style::default().bg(BG_BLACK));
-
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let now_playing = format!(" Playing: {}", app.now_playing);
-        let vol_label = format!("vol {:?}% [osno2] ", app.volume_state.value());
-
-        let header_cols = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(vol_label.len() as u16),
-        ])
-        .split(inner);
-
-        frame.render_widget(
-            Paragraph::new(now_playing).style(Style::default().fg(FG_BRIGHT).bg(BG_BLACK)),
-            header_cols[0],
-        );
-
-        frame.render_widget(
-            Paragraph::new(vol_label)
-                .alignment(Alignment::Right)
-                .style(Style::default().fg(FG_DIM).bg(BG_BLACK)),
-            header_cols[1],
-        );
-
-        let style = SliderStyle::minimal();
-        let slider = Slider::from_state(&app.volume_state)
-            .filled_color(style.filled_color)
-            .filled_symbol(style.filled_symbol);
-
-        frame.render_widget(slider, header_cols[1]);
     }
 
     fn render_main_view(&self, frame: &mut Frame, app: &App) {
@@ -473,10 +424,10 @@ impl AppLayout {
 
     /// UPDATE: Replaces old custom paragraph rendering with the live tui-term widget.
     fn render_shell(&self, frame: &mut Frame, vt_screen: &tui_term::vt100::Screen) {
-        let block = Block::bordered()
+        let block = Block::new()
             .title(" OS INTERACTIVE CONSOLE (Ctrl+T) ")
             .title_style(Style::default().fg(FG_BRIGHT).bold())
-            .border_style(Style::default().fg(BORDER_DIM))
+            //.border_style(Style::default().fg(BORDER_DIM))
             .style(Style::default().bg(BG_BLACK));
 
         let terminal_widget = PseudoTerminal::new(vt_screen).block(block);
