@@ -1552,6 +1552,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "jwalk",
+ "libc",
  "mime_guess",
  "notify",
  "opaline",
@@ -1573,6 +1574,7 @@ dependencies = [
  "tui-term",
  "vt100",
  "which",
+ "windows",
 ]
 
 [[package]]

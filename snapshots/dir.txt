@@ -1,0 +1,74 @@
+.
+├── Cargo.lock
+├── Cargo.toml
+├── LICENSE
+├── assets
+│   ├── default_config.toml
+│   └── wezterm.lua
+├── commands.txt
+├── dev_env
+│   └── config
+│       ├── library
+│       ├── playlists
+│       └── wezterm.lua
+├── dir.txt
+├── scripts
+│   └── setup.sh
+├── snapshots
+│   ├── snapshot.txt
+│   ├── source_code_v0.txt
+│   ├── source_code_v1.txt
+│   └── source_directory.txt
+└── src
+    ├── audio
+    │   ├── audio_engine.rs
+    │   ├── audio_state.rs
+    │   └── mod.rs
+    ├── config
+    │   ├── mod.rs
+    │   └── paths.rs
+    ├── core
+    │   ├── controller
+    │   │   ├── event_bus.rs
+    │   │   ├── events.rs
+    │   │   ├── input.rs
+    │   │   └── mod.rs
+    │   ├── mod.rs
+    │   ├── model
+    │   │   ├── codec_information.rs
+    │   │   ├── library.rs
+    │   │   ├── library_playlist.rs
+    │   │   ├── library_track.rs
+    │   │   ├── mod.rs
+    │   │   ├── reducer.rs
+    │   │   ├── scrollback.rs
+    │   │   ├── state.rs
+    │   │   ├── store.rs
+    │   │   └── view_state.rs
+    │   └── view
+    │       ├── frontend.rs
+    │       ├── mod.rs
+    │       ├── web
+    │       └── widgets
+    ├── fs
+    │   ├── fs_entry.rs
+    │   └── mod.rs
+    ├── ipc
+    │   └── mod.rs
+    ├── launcher.rs
+    ├── library
+    │   ├── library_service.rs
+    │   ├── library_utils.rs
+    │   ├── mod.rs
+    │   └── scanner.rs
+    ├── main.rs
+    ├── tty
+    │   ├── mod.rs
+    │   └── pty_helper.rs
+    ├── ui
+    │   ├── app.rs
+    │   ├── mod.rs
+    │   └── renderer.rs
+    └── worker.rs
+
+24 directories, 71 files

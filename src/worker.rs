@@ -105,10 +105,34 @@ fn event_loop(
     let cmd = CommandBuilder::new("powershell.exe");
 
     #[cfg(not(target_os = "windows"))]
-    let cmd = CommandBuilder::with_argv(vec![
-        std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string()),
-        "-i".to_string(),
-    ]);
+    let cmd = {
+        let exe = std::env::current_exe()?;
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+
+        let mut builder = CommandBuilder::new(exe);
+        builder.arg("--pty-helper");
+        builder.arg(shell);
+        builder.arg("-i");
+        builder
+    };
+
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let parent_pid = unsafe { libc::getppid() };
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if unsafe { libc::getppid() } != parent_pid {
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
 
     let _child = pty_pair.slave.spawn_command(cmd)?;
 
